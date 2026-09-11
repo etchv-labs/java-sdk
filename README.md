@@ -6,13 +6,13 @@ Official server-side client for image, PDF and video watermarking. Java 21+ and 
 
 Install locally from source (not yet published on Maven Central):
 ```sh
-git clone --branch v0.1.0 https://github.com/etchv-labs/java-sdk.git
+git clone --branch v0.2.0 https://github.com/etchv-labs/java-sdk.git
 mvn -f java-sdk/pom.xml install
 ```
 Then add to your application's `pom.xml`:
 ```xml
 <dependency>
-  <groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>0.1.0</version>
+  <groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>0.2.0</version>
 </dependency>
 ```
 
@@ -106,3 +106,30 @@ mvn test
 This public repository is synchronized from the Etchv development monorepo. Issues and pull
 requests are welcome; maintainers incorporate accepted changes into the source before publishing
 the next snapshot. The MIT license covers this SDK, not the hosted service.
+
+## Asset library
+
+New successful embeddings save original and verified output assets. Files remain
+downloadable for 30 days; records stay until deleted. Use `assets:read` for listing,
+inspection and downloads, `assets:write` for edits, and `assets:delete` with current
+owner/admin membership for deletion. Existing keys need replacement to add scopes.
+
+```java
+var page = client.listAssets(Map.of("kind", "watermarked", "limit", "25"));
+for (var item : page.items()) {
+    var asset = client.getAsset(item.id());
+    var updated = client.updateAsset(asset.id(), asset.version(),
+        Map.of("metadata", Map.of("campaign", "spring")));
+    if (updated.fileAvailable()) {
+        byte[] bytes = client.downloadAsset(updated.id());
+    }
+}
+// Use nextCursor() with the same filters to continue listing.
+```
+
+Edits require the current version; reload and reconcile on HTTP 409. Metadata is
+replaced, not merged, and does not change the embedded watermark. Asset operations
+consume no credits. Downloads require authentication and return the original file
+format. Single and bulk deletion methods are also available; batches contain at
+most 50 IDs and delete atomically. Deleting an output blocks its job result replay.
+See [the asset API](https://etchv.com/docs/api/assets) for the complete contract.

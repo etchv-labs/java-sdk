@@ -36,7 +36,7 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   public record EmbedResult(
-      byte[] bytes, String watermarkId, String requestId, String contentType, String filename) {}
+      byte[] bytes, String watermarkId, String requestId, String contentType, String filename, String assetId, String sourceAssetId) {}
 
   public record DetectionUnit(
       int index, boolean watermarked, double confidence, String watermarkId) {}
@@ -120,6 +120,46 @@ public final class EtchvClient implements AutoCloseable {
   public DetectionResult detectVideo(byte[] file, Options options) throws InterruptedException {
     return detect("videos", file, options);
   }
+
+  public record Asset(String id, String name, String kind, String mediaType, String format, String contentType,
+      long sizeBytes, String sha256, String parentAssetId, String requestId, String watermarkId, String createdAt,
+      String updatedAt, String fileExpiresAt, boolean fileAvailable, int version, JsonObject metadata, String downloadUrl) {}
+  public record AssetPage(List<Asset> items, String nextCursor) {}
+  private static final Gson ASSET_JSON = new GsonBuilder().serializeNulls().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES).create();
+  private static String assetPath(String id) {
+    if (id == null || !id.matches("ast_[a-f0-9]{64}")) throw new IllegalArgumentException("Invalid asset ID");
+    return "assets/" + id;
+  }
+  private byte[] assetRequest(String path, String method, Object body) throws InterruptedException {
+    var builder = HttpRequest.newBuilder(URI.create(base + "/" + path)).header("X-API-Key", key).timeout(timeout);
+    if (body != null) builder.header("Content-Type", "application/json");
+    builder.method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(ASSET_JSON.toJson(body)));
+    try {
+      var response = http.send(builder.build(), ignored -> new LimitedBody());
+      int status = response.statusCode();
+      if (status != 200 && status != 204) throw new EtchvException(status, new String(response.body(), 0, Math.min(response.body().length, 10000), StandardCharsets.UTF_8), response.headers().firstValue("X-Request-ID").orElse(null), null);
+      return response.body();
+    } catch (IOException e) { throw new EtchvException(0, e.getMessage(), null, null); }
+  }
+  public AssetPage listAssets(Map<String, String> options) throws InterruptedException {
+    var query = new StringBuilder("assets?");
+    for (var entry : options.entrySet()) {
+      if (!Set.of("limit", "cursor", "kind", "media_type", "watermark_id").contains(entry.getKey())) throw new IllegalArgumentException("Unknown asset filter");
+      query.append(entry.getKey()).append("=").append(java.net.URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8)).append("&");
+    }
+    return ASSET_JSON.fromJson(new String(assetRequest(query.toString(), "GET", null), StandardCharsets.UTF_8), AssetPage.class);
+  }
+  public Asset getAsset(String id) throws InterruptedException { return ASSET_JSON.fromJson(new String(assetRequest(assetPath(id), "GET", null), StandardCharsets.UTF_8), Asset.class); }
+  public Asset updateAsset(String id, int version, Map<String, ?> changes) throws InterruptedException {
+    var body = new HashMap<String, Object>(changes); body.put("version", version);
+    return ASSET_JSON.fromJson(new String(assetRequest(assetPath(id), "PATCH", body), StandardCharsets.UTF_8), Asset.class);
+  }
+  public void deleteAsset(String id) throws InterruptedException { assetRequest(assetPath(id), "DELETE", null); }
+  public void deleteAssets(List<String> ids) throws InterruptedException {
+    if (ids.isEmpty() || ids.size() > 50) throw new IllegalArgumentException("Provide 1–50 asset IDs"); ids.forEach(EtchvClient::assetPath);
+    assetRequest("assets/bulk-delete", "POST", Map.of("asset_ids", ids));
+  }
+  public byte[] downloadAsset(String id) throws InterruptedException { return assetRequest(assetPath(id) + "/content", "GET", null); }
 
   public EmbedResult getEmbedResult(String requestId) throws InterruptedException {
     if (!validJob(requestId)) throw new IllegalArgumentException("Invalid request ID");
@@ -337,7 +377,8 @@ public final class EtchvClient implements AutoCloseable {
         Pattern.compile("filename=\"([A-Za-z0-9._-]+)\"")
             .matcher(r.headers().firstValue("Content-Disposition").orElse(""));
     return new EmbedResult(
-        r.body(), id, requestId, mime, match.find() ? match.group(1) : "watermarked." + ext);
+        r.body(), id, requestId, mime, match.find() ? match.group(1) : "watermarked." + ext,
+        r.headers().firstValue("X-Asset-ID").orElse(null), r.headers().firstValue("X-Source-Asset-ID").orElse(null));
   }
 
   private static DetectionUnit unit(JsonObject v, int index) {
