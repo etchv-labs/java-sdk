@@ -1,0 +1,8 @@
+target/
+bin/
+obj/
+__pycache__/
+.env*
+*.nupkg
+
+classpath.txt
