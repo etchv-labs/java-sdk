@@ -6,13 +6,13 @@ Official server-side client for image, PDF and video watermarking. Java 21+ and 
 
 Install locally from source (not yet published on Maven Central):
 ```sh
-git clone --branch v0.2.0 https://github.com/etchv-labs/java-sdk.git
+git clone --branch v0.3.0 https://github.com/etchv-labs/java-sdk.git
 mvn -f java-sdk/pom.xml install
 ```
 Then add to your application's `pom.xml`:
 ```xml
 <dependency>
-  <groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>0.2.0</version>
+  <groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>0.3.0</version>
 </dependency>
 ```
 
@@ -133,3 +133,17 @@ consume no credits. Downloads require authentication and return the original fil
 format. Single and bulk deletion methods are also available; batches contain at
 most 50 IDs and delete atomically. Deleting an output blocks its job result replay.
 See [the asset API](https://etchv.com/docs/api/assets) for the complete contract.
+
+## Async jobs and webhooks
+
+Submit a background job and receive a JSON receipt without polling automatically. Choose `images`, `documents`, or `videos`; every currently supported native format uses the same submission method.
+
+```java
+var job = client.submitEmbed("documents", pdfBytes, Map.of("delivery", "delivery_001"),
+    new EtchvClient.Options("document.pdf", "delivery_001"), webhookId);
+var status = client.getJob(job.get("request_id").getAsString(), false);
+```
+
+Use the corresponding submission method for detection without forensic data. For detection status, set the status method’s `detect` argument to true. Existing embed/detect methods continue waiting for results.
+
+Create an endpoint in the [Etchv dashboard](https://etchv.com/dashboard/webhooks), then pass its ID when submitting. Persist your idempotency key before the upload so a lost receipt can be recovered safely. Download from the authenticated result URL after success, or use the existing result method. See the [async guide](https://etchv.com/docs/api/async) and [webhook verification guide](https://etchv.com/docs/api/webhooks).

@@ -161,6 +161,28 @@ public final class EtchvClient implements AutoCloseable {
   }
   public byte[] downloadAsset(String id) throws InterruptedException { return assetRequest(assetPath(id) + "/content", "GET", null); }
 
+  public JsonObject submitEmbed(String media, byte[] file, Map<String, ?> data, Options options, String webhookId) throws InterruptedException {
+    if (data == null || data.isEmpty()) throw new IllegalArgumentException("data must be a non-empty JSON object");
+    return submit(media, file, ASSET_JSON.toJson(data), options, webhookId);
+  }
+  public JsonObject submitDetection(String media, byte[] file, Options options, String webhookId) throws InterruptedException {
+    return submit(media, file, null, options, webhookId);
+  }
+  private JsonObject submit(String media, byte[] file, String data, Options options, String webhookId) throws InterruptedException {
+    if (!List.of("images", "documents", "videos").contains(media) || file == null || file.length == 0 || file.length > MAX_FILE_SIZE) throw new IllegalArgumentException("Invalid media or file size");
+    if (webhookId != null && !webhookId.matches("wh_[a-f0-9]{32}")) throw new IllegalArgumentException("Invalid webhook ID");
+    if (options == null) options = new Options();
+    String idempotency = options.idempotencyKey();
+    if (idempotency == null || idempotency.isEmpty()) idempotency = UUID.randomUUID().toString();
+    var r = request("watermarks/" + media + (data == null ? "/detect" : "") + "/async" + (webhookId == null ? "" : "?webhook_id=" + webhookId), file, data, new Options(options.filename() == null ? "file" : options.filename(), idempotency), true, data == null);
+    return JsonParser.parseString(new String(r.body(), StandardCharsets.UTF_8)).getAsJsonObject();
+  }
+  public JsonObject getJob(String requestId, boolean detect) throws InterruptedException {
+    if (!validJob(requestId)) throw new IllegalArgumentException("Invalid request ID");
+    var r = request("watermarks/" + (detect ? "detection-jobs" : "jobs") + "/" + requestId, null, null, new Options(), false, detect);
+    return JsonParser.parseString(new String(r.body(), StandardCharsets.UTF_8)).getAsJsonObject();
+  }
+
   public EmbedResult getEmbedResult(String requestId) throws InterruptedException {
     if (!validJob(requestId)) throw new IllegalArgumentException("Invalid request ID");
     return embedding(
@@ -313,7 +335,7 @@ public final class EtchvClient implements AutoCloseable {
       }
       requestId = response.headers().firstValue("X-Request-ID").orElse(requestId);
       int status = response.statusCode();
-      if (status == 200) return response;
+      if (status == 200 || (status == 202 && path.split("\\?", 2)[0].endsWith("/async"))) return response;
       JsonObject detail = new JsonObject();
       try {
         var value = JsonParser.parseString(new String(response.body(), StandardCharsets.UTF_8));
