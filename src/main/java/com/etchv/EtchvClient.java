@@ -29,14 +29,15 @@ public final class EtchvClient implements AutoCloseable {
     }
   }
 
-  public record Options(String filename, String idempotencyKey) {
+  public record Options(String filename, String idempotencyKey, String storageDestinationId, String storageKey) {
+    public Options(String filename, String idempotencyKey) { this(filename, idempotencyKey, null, null); }
     public Options() {
       this(null, null);
     }
   }
 
   public record EmbedResult(
-      byte[] bytes, String watermarkId, String requestId, String contentType, String filename, String assetId, String sourceAssetId) {}
+      byte[] bytes, String watermarkId, String requestId, String contentType, String filename, String assetId, String sourceAssetId, String storageDeliveryId) {}
 
   public record DetectionUnit(
       int index, boolean watermarked, double confidence, String watermarkId) {}
@@ -159,6 +160,10 @@ public final class EtchvClient implements AutoCloseable {
     if (ids.isEmpty() || ids.size() > 50) throw new IllegalArgumentException("Provide 1–50 asset IDs"); ids.forEach(EtchvClient::assetPath);
     assetRequest("assets/bulk-delete", "POST", Map.of("asset_ids", ids));
   }
+  public JsonObject getStorageDelivery(String id) throws InterruptedException {
+    if (!id.matches("std_[a-f0-9]{64}")) throw new IllegalArgumentException("Invalid storage delivery ID");
+    return ASSET_JSON.fromJson(new String(assetRequest("storage/deliveries/" + id, "GET", null), StandardCharsets.UTF_8), JsonObject.class);
+  }
   public byte[] downloadAsset(String id) throws InterruptedException { return assetRequest(assetPath(id) + "/content", "GET", null); }
 
   public JsonObject submitEmbed(String media, byte[] file, Map<String, ?> data, Options options, String webhookId) throws InterruptedException {
@@ -174,7 +179,7 @@ public final class EtchvClient implements AutoCloseable {
     if (options == null) options = new Options();
     String idempotency = options.idempotencyKey();
     if (idempotency == null || idempotency.isEmpty()) idempotency = UUID.randomUUID().toString();
-    var r = request("watermarks/" + media + (data == null ? "/detect" : "") + "/async" + (webhookId == null ? "" : "?webhook_id=" + webhookId), file, data, new Options(options.filename() == null ? "file" : options.filename(), idempotency), true, data == null);
+    var r = request("watermarks/" + media + (data == null ? "/detect" : "") + "/async" + (webhookId == null ? "" : "?webhook_id=" + webhookId), file, data, new Options(options.filename() == null ? "file" : options.filename(), idempotency, options.storageDestinationId(), options.storageKey()), true, data == null);
     return JsonParser.parseString(new String(r.body(), StandardCharsets.UTF_8)).getAsJsonObject();
   }
   public JsonObject getJob(String requestId, boolean detect) throws InterruptedException {
@@ -235,7 +240,7 @@ public final class EtchvClient implements AutoCloseable {
         "watermarks/" + media + (data == null ? "/detect" : ""),
         file,
         data,
-        new Options(filename, idempotency),
+        new Options(filename, idempotency, options.storageDestinationId(), options.storageKey()),
         durable,
         data == null && media.equals("videos"));
   }
@@ -306,6 +311,12 @@ public final class EtchvClient implements AutoCloseable {
   private HttpResponse<byte[]> request(
       String path, byte[] file, String data, Options options, boolean durable, boolean detectionJob)
       throws InterruptedException {
+    if (options.storageKey() != null && options.storageDestinationId() == null) throw new IllegalArgumentException("Storage key requires destination");
+    if (options.storageDestinationId() != null) {
+      if (data == null || !options.storageDestinationId().matches("dst_[a-f0-9]{32}")) throw new IllegalArgumentException("Invalid storage destination or detection request");
+      path += (path.contains("?") ? "&" : "?") + "storage_destination_id=" + java.net.URLEncoder.encode(options.storageDestinationId(), StandardCharsets.UTF_8);
+      if (options.storageKey() != null) path += "&storage_key=" + java.net.URLEncoder.encode(options.storageKey(), StandardCharsets.UTF_8);
+    }
     long started = System.nanoTime();
     String requestId = null;
     String boundary = "etchv-" + UUID.randomUUID();
@@ -400,7 +411,7 @@ public final class EtchvClient implements AutoCloseable {
             .matcher(r.headers().firstValue("Content-Disposition").orElse(""));
     return new EmbedResult(
         r.body(), id, requestId, mime, match.find() ? match.group(1) : "watermarked." + ext,
-        r.headers().firstValue("X-Asset-ID").orElse(null), r.headers().firstValue("X-Source-Asset-ID").orElse(null));
+        r.headers().firstValue("X-Asset-ID").orElse(null), r.headers().firstValue("X-Source-Asset-ID").orElse(null), r.headers().firstValue("X-Storage-Delivery-ID").orElse(null));
   }
 
   private static DetectionUnit unit(JsonObject v, int index) {
