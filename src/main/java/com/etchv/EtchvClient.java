@@ -124,7 +124,9 @@ public final class EtchvClient implements AutoCloseable {
 
   public record Asset(String id, String name, String kind, String mediaType, String format, String contentType,
       long sizeBytes, String sha256, String parentAssetId, String requestId, String watermarkId, String createdAt,
-      String updatedAt, String fileExpiresAt, boolean fileAvailable, int version, JsonObject metadata, String downloadUrl) {}
+      String updatedAt, String fileExpiresAt, boolean fileAvailable, int version, JsonObject metadata, String downloadUrl,
+      String storageProvider, String storageStatus, String storageDestinationId, String storageDeliveryId,
+      String stagingExpiresAt, String stagingDeletedAt) {}
   public record AssetPage(List<Asset> items, String nextCursor) {}
   private static final Gson ASSET_JSON = new GsonBuilder().serializeNulls().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES).create();
   private static String assetPath(String id) {

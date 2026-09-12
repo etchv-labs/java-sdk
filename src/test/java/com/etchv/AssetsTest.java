@@ -29,7 +29,9 @@ public class AssetsTest {
   });server.start();
   try(var c=new EtchvClient("test-key","http://127.0.0.1:"+server.getAddress().getPort(),Duration.ofSeconds(2))){
    assertEquals("next-page",c.listAssets(Map.of("kind","watermarked")).nextCursor());
-   assertEquals("launch",c.getAsset(id).metadata().get("campaign").getAsString());
+   var asset=c.getAsset(id);
+   assertEquals("launch",asset.metadata().get("campaign").getAsString());
+   assertNull(asset.fileExpiresAt()); assertEquals("s3",asset.storageProvider());
    assertEquals(2,c.updateAsset(id,1,Map.of("name","renamed")).version());
    assertArrayEquals("file".getBytes(StandardCharsets.UTF_8),c.downloadAsset(id));c.deleteAsset(id);c.deleteAssets(List.of(id));
    assertEquals(409,assertThrows(EtchvClient.EtchvException.class,()->c.listAssets(Map.of("cursor","next-page"))).statusCode);
