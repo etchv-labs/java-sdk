@@ -51,8 +51,14 @@ public final class EtchvClient implements AutoCloseable {
   /** Default client deadline for a single method call. */
   public static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(2);
 
-  /** Maximum upload and response size, in bytes (20 MB). */
-  public static final int MAX_FILE_SIZE = 20 * 1024 * 1024;
+  /**
+   * Maximum upload size, in bytes (50 MB). The API rejects PDFs and videos over 20 MB with status
+   * 413.
+   */
+  public static final int MAX_FILE_SIZE = 50 * 1024 * 1024;
+
+  /** Maximum response or result file size, in bytes (256 MB). */
+  public static final int MAX_DOWNLOAD_SIZE = 256 * 1024 * 1024;
 
   /** Maximum age of a webhook timestamp accepted by {@link #verifyWebhookSignature}. */
   public static final Duration WEBHOOK_TOLERANCE = Duration.ofMinutes(5);
@@ -475,7 +481,7 @@ public final class EtchvClient implements AutoCloseable {
    * <p>Generates an idempotency key when none is supplied, retries transient failures and polls
    * the durable job until the client deadline.
    *
-   * @param file encoded image bytes (1 byte to 20 MB)
+   * @param file encoded image bytes (1 byte to 50 MB)
    * @param data non-empty forensic JSON object
    * @param options request options, or null
    * @return the watermarked file
@@ -522,7 +528,7 @@ public final class EtchvClient implements AutoCloseable {
   /**
    * Detects a watermark in an image. Synchronous image detection is not retried automatically.
    *
-   * @param file encoded image bytes (1 byte to 20 MB)
+   * @param file encoded image bytes (1 byte to 50 MB)
    * @param options request options (storage options are not allowed), or null
    * @return detection result
    * @throws EtchvException on API or transport failure
@@ -566,7 +572,7 @@ public final class EtchvClient implements AutoCloseable {
    * its job receipt without waiting for processing.
    *
    * @param media {@code images}, {@code documents} or {@code videos}
-   * @param file file bytes (1 byte to 20 MB)
+   * @param file file bytes (1 byte to 50 MB; PDFs and videos up to 20 MB)
    * @param data non-empty forensic JSON object
    * @param options request options, or null; an idempotency key is generated when absent, but
    *     persist your own to recover a lost receipt
@@ -588,7 +594,7 @@ public final class EtchvClient implements AutoCloseable {
    * Submits a background detection job ({@code POST /watermarks/{media}/detect/async}).
    *
    * @param media {@code images}, {@code documents} or {@code videos}
-   * @param file file bytes (1 byte to 20 MB)
+   * @param file file bytes (1 byte to 50 MB; PDFs and videos up to 20 MB)
    * @param options request options (storage options are not allowed), or null
    * @param webhookId optional webhook endpoint ID ({@code wh_…}), or null
    * @return JSON job receipt
@@ -1221,7 +1227,7 @@ public final class EtchvClient implements AutoCloseable {
   private HttpResponse<byte[]> post(String media, byte[] file, String data, Options options)
       throws InterruptedException {
     if (file == null || file.length == 0 || file.length > MAX_FILE_SIZE)
-      throw new IllegalArgumentException("file must contain 1 byte to 20 MB");
+      throw new IllegalArgumentException("file must contain 1 byte to 50 MB");
     if (options == null) options = new Options();
     boolean durable = data != null || media.equals("videos");
     String filename = options.filename() != null ? options.filename() : defaultFilename(media);
@@ -1279,9 +1285,9 @@ public final class EtchvClient implements AutoCloseable {
 
     public void onNext(List<ByteBuffer> items) {
       for (var item : items) {
-        if ((long) bytes.size() + item.remaining() > MAX_FILE_SIZE) {
+        if ((long) bytes.size() + item.remaining() > MAX_DOWNLOAD_SIZE) {
           subscription.cancel();
-          result.completeExceptionally(new IOException("Response exceeds 20 MB"));
+          result.completeExceptionally(new IOException("Response exceeds 256 MB"));
           return;
         }
         byte[] chunk = new byte[item.remaining()];

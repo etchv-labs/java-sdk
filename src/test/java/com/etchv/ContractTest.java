@@ -112,6 +112,13 @@ public final class ContractTest {
           rejected = true;
         }
         check(rejected);
+        rejected = false;
+        try {
+          c.embedImage(new byte[EtchvClient.MAX_FILE_SIZE + 1], Map.of("a", 1), null);
+        } catch (IllegalArgumentException e) {
+          rejected = true;
+        }
+        check(rejected);
       }
       server.verify();
     }
