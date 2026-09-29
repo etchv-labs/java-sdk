@@ -67,8 +67,12 @@ public final class EtchvClient implements AutoCloseable {
    * Unchecked exception for a failed Etchv request.
    *
    * <p>{@link #statusCode()} is the HTTP status, or {@code 0} when no HTTP response was received
-   * (network failure or client deadline). The message never contains the API key or the response
-   * body; the bounded response body is available from {@link #detail()}.
+   * (network failure or client deadline). The message never contains the API key or the raw
+   * response body; the bounded response body is available from {@link #detail()}. When the API
+   * returns a structured error ({@code {"detail": {"message": ..., "code": ..., "limit": ...}}}),
+   * the message includes {@code detail.message} and {@link #code()}, {@link #detailMessage()} and
+   * {@link #limit()} expose its fields; {@link #retryAfter()} carries the {@code Retry-After} delay
+   * of an HTTP 429.
    */
   public static final class EtchvException extends RuntimeException {
     private static final long serialVersionUID = 1L;
@@ -84,6 +88,21 @@ public final class EtchvClient implements AutoCloseable {
 
     /** Idempotency key sent with the request, when any; may be null. */
     public final String idempotencyKey;
+
+    /**
+     * Machine-readable error code from a structured error body, such as {@code rate_limited} or
+     * {@code concurrency_limited}; may be null.
+     */
+    public final String code;
+
+    /** Human-readable message from the error body's {@code detail}; may be null. */
+    public final String detailMessage;
+
+    /** Delay requested by {@code Retry-After} on HTTP 429; may be null. */
+    public final Duration retryAfter;
+
+    /** Limit reported by a structured error body, such as the concurrent job limit; may be null. */
+    public final Integer limit;
 
     /**
      * Creates an exception.
@@ -107,16 +126,88 @@ public final class EtchvClient implements AutoCloseable {
      * @param cause underlying transport failure, or null
      */
     public EtchvException(int status, String detail, String requestId, String key, Throwable cause) {
+      this(status, detail, requestId, key, cause, null);
+    }
+
+    /**
+     * Creates an exception with an underlying cause and a {@code Retry-After} delay.
+     *
+     * @param status HTTP status code, or 0 for a transport failure
+     * @param detail bounded response body or client-side reason
+     * @param requestId Etchv request ID, when known
+     * @param key idempotency key sent with the request, when any
+     * @param cause underlying transport failure, or null
+     * @param retryAfter delay requested by {@code Retry-After}, or null
+     */
+    public EtchvException(
+        int status,
+        String detail,
+        String requestId,
+        String key,
+        Throwable cause,
+        Duration retryAfter) {
+      this(status, detail, requestId, key, cause, retryAfter, ParsedDetail.of(status, detail));
+    }
+
+    private EtchvException(
+        int status,
+        String detail,
+        String requestId,
+        String key,
+        Throwable cause,
+        Duration retryAfter,
+        ParsedDetail parsed) {
       super(
           (status == 0
                   ? "Etchv request failed without an HTTP response"
                   : "Etchv request failed (HTTP " + status + ")")
+              + (parsed.structured() && parsed.message() != null ? ": " + parsed.message() : "")
               + (requestId == null ? "" : "; request ID " + requestId),
           cause);
       this.statusCode = status;
       this.detail = detail;
       this.requestId = requestId;
       this.idempotencyKey = key;
+      this.retryAfter = retryAfter;
+      this.code = parsed.code();
+      this.detailMessage = parsed.message();
+      this.limit = parsed.limit();
+    }
+
+    /** Fields of the error body's {@code detail}; {@code structured} when it is an object. */
+    private record ParsedDetail(String code, String message, Integer limit, boolean structured) {
+      static ParsedDetail of(int status, String detail) {
+        if (status != 0 && detail != null) {
+          try {
+            var body = JsonParser.parseString(detail);
+            var value = body.isJsonObject() ? body.getAsJsonObject().get("detail") : null;
+            if (value != null && value.isJsonObject()) {
+              var object = value.getAsJsonObject();
+              return new ParsedDetail(
+                  string(object.get("code")), string(object.get("message")), integer(object.get("limit")), true);
+            }
+            return new ParsedDetail(null, string(value), null, false);
+          } catch (RuntimeException ignored) {
+            // Not JSON: detail() still carries the bounded body.
+          }
+        }
+        return new ParsedDetail(null, null, null, false);
+      }
+    }
+
+    private static String string(JsonElement value) {
+      return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()
+          ? value.getAsString()
+          : null;
+    }
+
+    private static Integer integer(JsonElement value) {
+      if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) return null;
+      try {
+        return value.getAsBigDecimal().intValueExact();
+      } catch (ArithmeticException notAnInt) {
+        return null;
+      }
     }
 
     /**
@@ -156,6 +247,45 @@ public final class EtchvClient implements AutoCloseable {
     }
 
     /**
+     * Returns the machine-readable error code, such as {@code rate_limited} or {@code
+     * concurrency_limited} for HTTP 429.
+     *
+     * @return error code, or null when the body has none
+     */
+    public String code() {
+      return code;
+    }
+
+    /**
+     * Returns the human-readable message from the error body's {@code detail}. When {@code detail}
+     * is an object, this message is also part of {@link #getMessage()}.
+     *
+     * @return message, or null when the body has none
+     */
+    public String detailMessage() {
+      return detailMessage;
+    }
+
+    /**
+     * Returns the limit reported by a structured error body, such as the request or concurrent job
+     * limit on HTTP 429.
+     *
+     * @return limit, or null when the body has none
+     */
+    public Integer limit() {
+      return limit;
+    }
+
+    /**
+     * Returns the {@code Retry-After} delay of an HTTP 429 response.
+     *
+     * @return delay, or null when absent or not rate limited
+     */
+    public Duration retryAfter() {
+      return retryAfter;
+    }
+
+    /**
      * Whether a saved job result or asset file expired or was deleted (HTTP 410). Retrying with
      * the same idempotency key does not charge again.
      *
@@ -163,6 +293,54 @@ public final class EtchvClient implements AutoCloseable {
      */
     public boolean isGone() {
       return statusCode == 410;
+    }
+  }
+
+  /**
+   * Processing hardware for a watermark or detection request ({@code accelerator} query
+   * parameter).
+   *
+   * <p>{@link #GPU} requires a Business or Enterprise plan (other plans receive HTTP 403) and costs
+   * 3× credits. When no GPU is ready, the request runs on CPU at normal credits; the result's
+   * {@code accelerator()} reports the hardware that actually ran.
+   */
+  public enum Accelerator {
+    /** CPU processing (the API default). */
+    CPU("cpu"),
+    /** GPU processing (Business or Enterprise plans). */
+    GPU("gpu");
+
+    private final String value;
+
+    Accelerator(String value) {
+      this.value = value;
+    }
+
+    /**
+     * Returns the wire value.
+     *
+     * @return {@code cpu} or {@code gpu}
+     */
+    public String value() {
+      return value;
+    }
+
+    /**
+     * Parses a wire value.
+     *
+     * @param value {@code cpu} or {@code gpu}, case-insensitive
+     * @return the accelerator, or null for a missing or unknown value
+     */
+    public static Accelerator fromValue(String value) {
+      if (value == null) return null;
+      for (var accelerator : values())
+        if (accelerator.value.equalsIgnoreCase(value.trim())) return accelerator;
+      return null;
+    }
+
+    @Override
+    public String toString() {
+      return value;
     }
   }
 
@@ -176,9 +354,37 @@ public final class EtchvClient implements AutoCloseable {
    *     embedding results; null uses Etchv storage
    * @param storageKey optional relative object key beneath the destination prefix; requires a
    *     destination
+   * @param accelerator requested processing hardware; null omits the parameter (CPU)
    */
   public record Options(
-      String filename, String idempotencyKey, String storageDestinationId, String storageKey) {
+      String filename,
+      String idempotencyKey,
+      String storageDestinationId,
+      String storageKey,
+      Accelerator accelerator) {
+    /**
+     * Options without an accelerator.
+     *
+     * @param filename original filename, or null
+     * @param idempotencyKey idempotency key, or null
+     * @param storageDestinationId storage destination ID, or null
+     * @param storageKey storage object key, or null
+     */
+    public Options(
+        String filename, String idempotencyKey, String storageDestinationId, String storageKey) {
+      this(filename, idempotencyKey, storageDestinationId, storageKey, null);
+    }
+
+    /**
+     * Returns a copy of these options with the given accelerator.
+     *
+     * @param accelerator requested processing hardware, or null for the default (CPU)
+     * @return new options
+     */
+    public Options withAccelerator(Accelerator accelerator) {
+      return new Options(filename, idempotencyKey, storageDestinationId, storageKey, accelerator);
+    }
+
     /**
      * Options without a storage destination.
      *
@@ -206,6 +412,7 @@ public final class EtchvClient implements AutoCloseable {
    * @param assetId watermarked asset ID, when recorded
    * @param sourceAssetId original upload asset ID, when recorded
    * @param storageDeliveryId customer storage delivery ID, when a destination was selected
+   * @param accelerator hardware that actually processed the request, or null when not reported
    */
   public record EmbedResult(
       byte[] bytes,
@@ -215,7 +422,41 @@ public final class EtchvClient implements AutoCloseable {
       String filename,
       String assetId,
       String sourceAssetId,
-      String storageDeliveryId) {}
+      String storageDeliveryId,
+      Accelerator accelerator) {
+    /**
+     * Creates a result without accelerator information.
+     *
+     * @param bytes watermarked file
+     * @param watermarkId watermark ID
+     * @param requestId request ID
+     * @param contentType MIME type
+     * @param filename suggested filename
+     * @param assetId watermarked asset ID, or null
+     * @param sourceAssetId original asset ID, or null
+     * @param storageDeliveryId storage delivery ID, or null
+     */
+    public EmbedResult(
+        byte[] bytes,
+        String watermarkId,
+        String requestId,
+        String contentType,
+        String filename,
+        String assetId,
+        String sourceAssetId,
+        String storageDeliveryId) {
+      this(
+          bytes,
+          watermarkId,
+          requestId,
+          contentType,
+          filename,
+          assetId,
+          sourceAssetId,
+          storageDeliveryId,
+          null);
+    }
+  }
 
   /**
    * Detection result for one frame, page or composite.
@@ -236,13 +477,33 @@ public final class EtchvClient implements AutoCloseable {
    * @param watermarkId decoded watermark ID when all units agree, otherwise null
    * @param requestId Etchv request ID
    * @param units per-unit results
+   * @param accelerator hardware that actually processed the request, or null when not reported
    */
   public record DetectionResult(
       boolean watermarked,
       double confidence,
       String watermarkId,
       String requestId,
-      List<DetectionUnit> units) {}
+      List<DetectionUnit> units,
+      Accelerator accelerator) {
+    /**
+     * Creates a result without accelerator information.
+     *
+     * @param watermarked whether every unit carries the same watermark
+     * @param confidence lowest per-unit confidence
+     * @param watermarkId decoded watermark ID, or null
+     * @param requestId request ID
+     * @param units per-unit results
+     */
+    public DetectionResult(
+        boolean watermarked,
+        double confidence,
+        String watermarkId,
+        String requestId,
+        List<DetectionUnit> units) {
+      this(watermarked, confidence, watermarkId, requestId, units, null);
+    }
+  }
 
   /**
    * An asset library record.
@@ -478,8 +739,11 @@ public final class EtchvClient implements AutoCloseable {
   /**
    * Watermarks an image and waits for the verified result.
    *
-   * <p>Generates an idempotency key when none is supplied, retries transient failures and polls
-   * the durable job until the client deadline.
+   * <p>Generates an idempotency key when none is supplied, retries transient failures (including
+   * HTTP 429, after {@code Retry-After}) and polls the durable job until the client deadline.
+   *
+   * <p>Set {@link Options#accelerator()} to {@link Accelerator#GPU} for GPU processing on Business
+   * and Enterprise plans; {@link EmbedResult#accelerator()} reports the hardware that ran.
    *
    * @param file encoded image bytes (1 byte to 50 MB)
    * @param data non-empty forensic JSON object
@@ -613,7 +877,8 @@ public final class EtchvClient implements AutoCloseable {
    * @param requestId job ID ({@code req_…})
    * @param detect true for a detection job, false for an embedding job
    * @return JSON job receipt; {@code status} is {@code queued}, {@code running}, {@code
-   *     retrying}, {@code succeeded} or {@code failed}
+   *     retrying}, {@code succeeded} or {@code failed}; {@code accelerator_requested} and {@code
+   *     accelerator} report the requested and actual processing hardware
    * @throws EtchvException on API or transport failure
    * @throws InterruptedException if the thread is interrupted
    */
@@ -1152,7 +1417,9 @@ public final class EtchvClient implements AutoCloseable {
           status,
           bounded(response.body()),
           response.headers().firstValue("X-Request-ID").orElse(null),
-          null);
+          null,
+          null,
+          rateLimitDelay(response));
     return response;
   }
 
@@ -1198,7 +1465,8 @@ public final class EtchvClient implements AutoCloseable {
                 options.filename() == null ? defaultFilename(media) : options.filename(),
                 idempotency,
                 options.storageDestinationId(),
-                options.storageKey()),
+                options.storageKey(),
+                options.accelerator()),
             true,
             data == null);
     return parseObject(r.body());
@@ -1238,7 +1506,12 @@ public final class EtchvClient implements AutoCloseable {
         "watermarks/" + media + (data == null ? "/detect" : ""),
         file,
         data,
-        new Options(filename, idempotency, options.storageDestinationId(), options.storageKey()),
+        new Options(
+            filename,
+            idempotency,
+            options.storageDestinationId(),
+            options.storageKey(),
+            options.accelerator()),
         durable,
         data == null && media.equals("videos"));
   }
@@ -1321,6 +1594,8 @@ public final class EtchvClient implements AutoCloseable {
               + encode(options.storageDestinationId());
       if (options.storageKey() != null) path += "&storage_key=" + encode(options.storageKey());
     }
+    if (options.accelerator() != null)
+      path += (path.contains("?") ? "&" : "?") + "accelerator=" + options.accelerator().value();
     long started = System.nanoTime();
     String requestId = null;
     String boundary = "etchv-" + UUID.randomUUID();
@@ -1376,22 +1651,28 @@ public final class EtchvClient implements AutoCloseable {
                 + requestId
                 + "/result";
         body = null;
-        double delay = 1;
-        try {
-          delay = Double.parseDouble(response.headers().firstValue("Retry-After").orElse("1"));
-        } catch (NumberFormatException ignored) {
-        }
-        pause(started, Double.isFinite(delay) ? Math.max(.01, Math.min(5, delay)) : 1);
+        pause(
+            started, retryDelaySeconds(response.headers().firstValue("Retry-After").orElse(null)));
         continue;
       }
       if (durable
           && Set.of(429, 502, 503, 504).contains(status)
           && !new JsonPrimitive("failed").equals(detail.get("status"))) {
-        pause(started, 1);
+        // Rate limits honor Retry-After (at most 5 s per wait); waits never pass the deadline.
+        pause(
+            started,
+            status == 429
+                ? retryDelaySeconds(response.headers().firstValue("Retry-After").orElse(null))
+                : 1);
         continue;
       }
       throw new EtchvException(
-          status, bounded(response.body()), requestId, options.idempotencyKey());
+          status,
+          bounded(response.body()),
+          requestId,
+          options.idempotencyKey(),
+          null,
+          rateLimitDelay(response));
     }
     throw new EtchvException(
         0,
@@ -1399,6 +1680,43 @@ public final class EtchvClient implements AutoCloseable {
         requestId,
         options.idempotencyKey(),
         lastFailure);
+  }
+
+  /** Retry wait in seconds: Retry-After clamped to 10 ms–5 s, or 1 second when absent/invalid. */
+  static double retryDelaySeconds(String header) {
+    Duration delay = parseRetryAfter(header);
+    return delay == null ? 1 : Math.min(5, Math.max(.01, delay.toNanos() / 1e9));
+  }
+
+  /** Retry-After as delta-seconds or an HTTP date; null when absent or invalid. */
+  static Duration parseRetryAfter(String header) {
+    if (header == null || header.isBlank()) return null;
+    try {
+      double seconds = Double.parseDouble(header.trim());
+      return Double.isFinite(seconds) && seconds <= 1e9
+          ? Duration.ofNanos((long) (Math.max(0, seconds) * 1e9))
+          : null;
+    } catch (NumberFormatException ignored) {
+    }
+    try {
+      var date =
+          java.time.ZonedDateTime.parse(
+              header.trim(), java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME);
+      var delay = Duration.between(Instant.now(), date.toInstant());
+      return delay.isNegative() ? Duration.ZERO : delay;
+    } catch (java.time.format.DateTimeParseException ignored) {
+      return null;
+    }
+  }
+
+  private static Duration rateLimitDelay(HttpResponse<?> response) {
+    return response.statusCode() == 429
+        ? parseRetryAfter(response.headers().firstValue("Retry-After").orElse(null))
+        : null;
+  }
+
+  private static Accelerator accelerator(HttpResponse<?> response) {
+    return Accelerator.fromValue(response.headers().firstValue("X-Etchv-Accelerator").orElse(null));
   }
 
   private void pause(long started, double seconds) throws InterruptedException {
@@ -1424,7 +1742,8 @@ public final class EtchvClient implements AutoCloseable {
         match.find() ? match.group(1) : "watermarked." + ext,
         r.headers().firstValue("X-Asset-ID").orElse(null),
         r.headers().firstValue("X-Source-Asset-ID").orElse(null),
-        r.headers().firstValue("X-Storage-Delivery-ID").orElse(null));
+        r.headers().firstValue("X-Storage-Delivery-ID").orElse(null),
+        accelerator(r));
   }
 
   private static DetectionUnit unit(JsonObject v, int index) {
@@ -1470,8 +1789,20 @@ public final class EtchvClient implements AutoCloseable {
         }
         if (units.isEmpty()) throw new IllegalArgumentException();
       } else units.add(top);
+      var accelerator = accelerator(r);
+      var reported = v.get("accelerator");
+      if (accelerator == null
+          && reported != null
+          && reported.isJsonPrimitive()
+          && reported.getAsJsonPrimitive().isString())
+        accelerator = Accelerator.fromValue(reported.getAsString());
       return new DetectionResult(
-          top.watermarked(), top.confidence(), top.watermarkId(), requestId, List.copyOf(units));
+          top.watermarked(),
+          top.confidence(),
+          top.watermarkId(),
+          requestId,
+          List.copyOf(units),
+          accelerator);
     } catch (RuntimeException e) {
       throw new EtchvException(200, "Invalid detection response", requestId, null);
     }

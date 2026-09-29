@@ -40,6 +40,20 @@ class Example {
 }
 ```
 
+## GPU processing
+
+Business and Enterprise plans can request GPU processing for any embed, detect or async submission; other plans
+receive HTTP 403. GPU operations cost 3× credits. If no GPU is ready, the request runs on CPU at normal credits.
+`accelerator()` on the result reports the hardware that actually ran (null when not reported).
+
+```java
+var options = new EtchvClient.Options("photo.jpg", null).withAccelerator(EtchvClient.Accelerator.GPU);
+var result = client.embedImage(bytes, Map.of("recipient", "customer-123"), options);
+System.out.println(result.accelerator()); // gpu, or cpu after a fallback
+```
+
+Job receipts from `getJob` include `accelerator_requested` and `accelerator`.
+
 ## Async jobs
 
 ```java
@@ -68,6 +82,11 @@ Detection uses `submitDetection`, `getJob(requestId, true)` and `getDetectionRes
 API and transport failures throw the unchecked `EtchvClient.EtchvException` with `statusCode()` (`0` when no HTTP
 response), `requestId()`, `idempotencyKey()`, `detail()` and `isGone()` (HTTP 410). Include the request ID when
 contacting support.
+
+Durable operations (embedding, video detection, async submissions and job results) retry HTTP 429, 502, 503 and
+504 with the same idempotency key until the client deadline; rate-limited responses wait for `Retry-After` (up to
+5 s per wait). Structured errors include the API's message in `getMessage()` and expose `code()` (for example
+`rate_limited` or `concurrency_limited`), `detailMessage()` and `limit()`; a 429 also carries `retryAfter()`.
 
 ```java
 } catch (EtchvClient.EtchvException e) {
