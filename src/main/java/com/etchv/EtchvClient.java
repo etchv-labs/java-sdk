@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.0.0";
+  public static final String VERSION = "1.1.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -52,10 +52,25 @@ public final class EtchvClient implements AutoCloseable {
   public static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(2);
 
   /**
-   * Maximum upload size, in bytes (50 MB). The API rejects PDFs and videos over 20 MB with status
-   * 413.
+   * Maximum file size for embedding, in bytes (50 MB). The API rejects PDFs and videos over 20 MB
+   * with status 413.
    */
   public static final int MAX_FILE_SIZE = 50 * 1024 * 1024;
+
+  /**
+   * Maximum file size for detection, in bytes (192 MB): the largest file Etchv delivers. Each kind
+   * keeps its own delivered limit (images 192 MB, PDFs 64 MB, video 100 MB).
+   */
+  public static final int MAX_DETECTION_FILE_SIZE = 192 * 1024 * 1024;
+
+  /**
+   * Default size above which files are sent through an upload session ({@link #uploadFile})
+   * instead of in the request body (40 MB).
+   */
+  public static final int LARGE_FILE_THRESHOLD = 40 * 1024 * 1024;
+
+  /** Synchronous image and PDF detection stops here; larger delivered files run as a job. */
+  private static final int SYNC_DETECTION_MAX_SIZE = 95 * 1024 * 1024;
 
   /** Maximum response or result file size, in bytes (256 MB). */
   public static final int MAX_DOWNLOAD_SIZE = 256 * 1024 * 1024;
@@ -657,6 +672,7 @@ public final class EtchvClient implements AutoCloseable {
   private final HttpClient http;
   private final String key, base;
   private final Duration timeout;
+  private final int largeFileThreshold;
 
   /**
    * Creates a client for {@value #DEFAULT_BASE_URL} with a two-minute deadline.
@@ -677,6 +693,23 @@ public final class EtchvClient implements AutoCloseable {
    * @throws IllegalArgumentException if an argument is invalid
    */
   public EtchvClient(String apiKey, String baseUrl, Duration timeout) {
+    this(apiKey, baseUrl, timeout, LARGE_FILE_THRESHOLD);
+  }
+
+  /**
+   * Creates a client with a custom large-file threshold.
+   *
+   * @param apiKey Etchv API key
+   * @param baseUrl API base URL; must use HTTPS (HTTP is allowed for localhost only)
+   * @param timeout positive deadline for each method call, including polling and retries
+   * @param largeFileThreshold files above this many bytes are sent through an upload session
+   *     ({@link #uploadFile}) instead of in the request body; default {@link #LARGE_FILE_THRESHOLD}
+   * @throws IllegalArgumentException if an argument is invalid
+   */
+  public EtchvClient(String apiKey, String baseUrl, Duration timeout, int largeFileThreshold) {
+    if (largeFileThreshold < 1)
+      throw new IllegalArgumentException("largeFileThreshold must be a positive number of bytes");
+    this.largeFileThreshold = largeFileThreshold;
     if (apiKey == null
         || apiKey.isBlank()
         || apiKey.contains("\r")
@@ -719,6 +752,102 @@ public final class EtchvClient implements AutoCloseable {
   @Override
   public String toString() {
     return "EtchvClient[baseUrl=" + base + ", timeout=" + timeout + "]";
+  }
+
+  // ---------------------------------------------------------------- Upload sessions
+
+  /**
+   * An upload session: the file was uploaded once and can be referenced by {@link #uploadId()}.
+   *
+   * @param uploadId session ID ({@code upl_…}); send it as the {@code upload_id} form field
+   *     instead of {@code file}
+   * @param kind {@code image}, {@code document}, {@code video} or {@code detect}
+   * @param filename sanitized file name
+   * @param size file size in bytes
+   * @param status {@code received} once the upload succeeded
+   * @param expiresAt when the session expires (ISO 8601)
+   */
+  public record UploadSession(
+      String uploadId, String kind, String filename, long size, String status, String expiresAt) {}
+
+  /**
+   * Uploads a file once to a signed URL ({@code POST /uploads}, then {@code PUT} to the returned
+   * URL) and returns its session. Embed, detect and submit methods do this automatically above the
+   * large-file threshold; retries reuse the same upload.
+   *
+   * <p>The signed URL carries its own authorization, so the API key is never sent to it.
+   *
+   * @param kind {@code image}, {@code document}, {@code video} or {@code detect}
+   * @param file file bytes (at least 1 byte)
+   * @param filename file name, or null for {@code file}
+   * @return the received session
+   * @throws EtchvException on API, upload, transport or deadline failure
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public UploadSession uploadFile(String kind, byte[] file, String filename)
+      throws InterruptedException {
+    if (!Set.of("image", "document", "video", "detect").contains(kind))
+      throw new IllegalArgumentException("kind must be image, document, video or detect");
+    if (file == null || file.length == 0)
+      throw new IllegalArgumentException("file must contain at least 1 byte");
+    long started = System.nanoTime();
+    var request = new LinkedHashMap<String, Object>();
+    request.put("kind", kind);
+    request.put("filename", filename == null ? "file" : filename);
+    request.put("size", file.length);
+    var session = parseObject(send("uploads", "POST", request).body());
+    URI url;
+    try {
+      var upload = session.getAsJsonObject("upload");
+      if (!"PUT".equals(upload.get("method").getAsString())) throw new IllegalStateException();
+      url = URI.create(upload.get("url").getAsString());
+      if (!("https".equals(url.getScheme())
+          || ("http".equals(url.getScheme())
+              && Set.of("localhost", "127.0.0.1", "[::1]").contains(url.getHost()))))
+        throw new IllegalStateException();
+    } catch (RuntimeException e) {
+      throw new EtchvException(201, "Invalid upload session response", null, null);
+    }
+    IOException lastFailure = null;
+    while (System.nanoTime() - started < timeout.toNanos()) {
+      if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+      var put =
+          HttpRequest.newBuilder(url)
+              .header("User-Agent", USER_AGENT)
+              .header("Content-Type", "application/octet-stream")
+              .timeout(
+                  Duration.ofNanos(Math.max(1, timeout.toNanos() - (System.nanoTime() - started))))
+              .PUT(HttpRequest.BodyPublishers.ofByteArray(file))
+              .build();
+      HttpResponse<byte[]> response;
+      try {
+        response = http.send(put, ignored -> new LimitedBody());
+      } catch (IOException e) {
+        lastFailure = e;
+        pause(started, 1);
+        continue;
+      }
+      int status = response.statusCode();
+      if (status == 200) {
+        try {
+          return new UploadSession(
+              session.get("upload_id").getAsString(),
+              session.get("kind").getAsString(),
+              session.get("filename").getAsString(),
+              session.get("size").getAsLong(),
+              "received",
+              session.has("expires_at") ? session.get("expires_at").getAsString() : null);
+        } catch (RuntimeException e) {
+          throw new EtchvException(201, "Invalid upload session response", null, null);
+        }
+      }
+      if (Set.of(500, 502, 503, 504).contains(status)) {
+        pause(started, 1);
+        continue;
+      }
+      throw new EtchvException(status, bounded(response.body()), null, null);
+    }
+    throw new EtchvException(0, "Client deadline exceeded", null, null, lastFailure);
   }
 
   // ---------------------------------------------------------------- Connection check
@@ -1445,13 +1574,14 @@ public final class EtchvClient implements AutoCloseable {
     if (!MEDIA.contains(media)
         || file == null
         || file.length == 0
-        || file.length > MAX_FILE_SIZE)
+        || file.length > (data == null ? MAX_DETECTION_FILE_SIZE : MAX_FILE_SIZE))
       throw new IllegalArgumentException("Invalid media or file size");
     if (webhookId != null && !matches(WEBHOOK_ID, webhookId))
       throw new IllegalArgumentException("Invalid webhook ID");
     if (options == null) options = new Options();
     String idempotency = options.idempotencyKey();
     if (idempotency == null || idempotency.isEmpty()) idempotency = UUID.randomUUID().toString();
+    String filename = options.filename() == null ? defaultFilename(media) : options.filename();
     var r =
         request(
             "watermarks/"
@@ -1460,9 +1590,10 @@ public final class EtchvClient implements AutoCloseable {
                 + "/async"
                 + (webhookId == null ? "" : "?webhook_id=" + webhookId),
             file,
+            uploadIdFor(media, file, data == null, filename),
             data,
             new Options(
-                options.filename() == null ? defaultFilename(media) : options.filename(),
+                filename,
                 idempotency,
                 options.storageDestinationId(),
                 options.storageKey(),
@@ -1489,13 +1620,41 @@ public final class EtchvClient implements AutoCloseable {
 
   private DetectionResult detect(String media, byte[] file, Options options)
       throws InterruptedException {
+    if (file != null && file.length > MAX_DETECTION_FILE_SIZE)
+      throw new IllegalArgumentException(
+          "file must contain 1 byte to " + MAX_DETECTION_FILE_SIZE / (1024 * 1024) + " MB");
+    if (!media.equals("videos") && file != null && file.length > SYNC_DETECTION_MAX_SIZE) {
+      // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
+      var receipt = submitDetection(media, file, options, null);
+      return getDetectionResult(receipt.get("request_id").getAsString());
+    }
     return detection(post(media, file, null, options));
+  }
+
+  /**
+   * The upload session to send instead of the file, or null when the file fits in the request.
+   * Uploaded once per call, so every retry of the request reuses it.
+   */
+  private String uploadIdFor(String media, byte[] file, boolean detect, String filename)
+      throws InterruptedException {
+    if (file == null || file.length <= largeFileThreshold) return null;
+    String kind =
+        detect
+            ? "detect"
+            : switch (media) {
+              case "documents" -> "document";
+              case "videos" -> "video";
+              default -> "image";
+            };
+    return uploadFile(kind, file, filename).uploadId();
   }
 
   private HttpResponse<byte[]> post(String media, byte[] file, String data, Options options)
       throws InterruptedException {
-    if (file == null || file.length == 0 || file.length > MAX_FILE_SIZE)
-      throw new IllegalArgumentException("file must contain 1 byte to 50 MB");
+    int limit = data == null ? MAX_DETECTION_FILE_SIZE : MAX_FILE_SIZE;
+    if (file == null || file.length == 0 || file.length > limit)
+      throw new IllegalArgumentException(
+          "file must contain 1 byte to " + limit / (1024 * 1024) + " MB");
     if (options == null) options = new Options();
     boolean durable = data != null || media.equals("videos");
     String filename = options.filename() != null ? options.filename() : defaultFilename(media);
@@ -1505,6 +1664,7 @@ public final class EtchvClient implements AutoCloseable {
     return request(
         "watermarks/" + media + (data == null ? "/detect" : ""),
         file,
+        uploadIdFor(media, file, data == null, filename),
         data,
         new Options(
             filename,
@@ -1516,19 +1676,30 @@ public final class EtchvClient implements AutoCloseable {
         data == null && media.equals("videos"));
   }
 
-  private static byte[] multipart(byte[] file, String data, String filename, String boundary) {
+  private static byte[] multipart(
+      byte[] file, String uploadId, String data, String filename, String boundary) {
     var out = new ByteArrayOutputStream();
-    String safe =
-        filename.replace("\r", "_").replace("\n", "_").replace("\"", "_").replace("\\", "_");
-    out.writeBytes(
-        ("--"
-                + boundary
-                + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\""
-                + safe
-                + "\"\r\nContent-Type: application/octet-stream\r\n\r\n")
-            .getBytes(StandardCharsets.UTF_8));
-    out.writeBytes(file);
-    out.writeBytes("\r\n".getBytes(StandardCharsets.UTF_8));
+    if (uploadId != null) {
+      out.writeBytes(
+          ("--"
+                  + boundary
+                  + "\r\nContent-Disposition: form-data; name=\"upload_id\"\r\n\r\n"
+                  + uploadId
+                  + "\r\n")
+              .getBytes(StandardCharsets.UTF_8));
+    } else {
+      String safe =
+          filename.replace("\r", "_").replace("\n", "_").replace("\"", "_").replace("\\", "_");
+      out.writeBytes(
+          ("--"
+                  + boundary
+                  + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\""
+                  + safe
+                  + "\"\r\nContent-Type: application/octet-stream\r\n\r\n")
+              .getBytes(StandardCharsets.UTF_8));
+      out.writeBytes(file);
+      out.writeBytes("\r\n".getBytes(StandardCharsets.UTF_8));
+    }
     if (data != null)
       out.writeBytes(
           ("--"
@@ -1583,6 +1754,19 @@ public final class EtchvClient implements AutoCloseable {
   private HttpResponse<byte[]> request(
       String path, byte[] file, String data, Options options, boolean durable, boolean detectionJob)
       throws InterruptedException {
+    return request(path, file, null, data, options, durable, detectionJob);
+  }
+
+  /** As above; with {@code uploadId}, the form names that upload session instead of the file. */
+  private HttpResponse<byte[]> request(
+      String path,
+      byte[] file,
+      String uploadId,
+      String data,
+      Options options,
+      boolean durable,
+      boolean detectionJob)
+      throws InterruptedException {
     if (options.storageKey() != null && options.storageDestinationId() == null)
       throw new IllegalArgumentException("Storage key requires destination");
     if (options.storageDestinationId() != null) {
@@ -1599,7 +1783,8 @@ public final class EtchvClient implements AutoCloseable {
     long started = System.nanoTime();
     String requestId = null;
     String boundary = "etchv-" + UUID.randomUUID();
-    byte[] body = file == null ? null : multipart(file, data, options.filename(), boundary);
+    byte[] body =
+        file == null ? null : multipart(file, uploadId, data, options.filename(), boundary);
     IOException lastFailure = null;
     while (System.nanoTime() - started < timeout.toNanos()) {
       if (Thread.currentThread().isInterrupted()) throw new InterruptedException();

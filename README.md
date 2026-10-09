@@ -7,13 +7,13 @@ Server-side Java client for [Etchv](https://etchv.com): embed and detect invisib
 Maven:
 
 ```xml
-<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.0.0</version></dependency>
+<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.1.0</version></dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("com.etchv:etchv-sdk:1.0.0")
+implementation("com.etchv:etchv-sdk:1.1.0")
 ```
 
 Requires Java 21+. `EtchvClient` is thread-safe; create one and close it on shutdown.
@@ -38,6 +38,22 @@ class Example {
         }
     }
 }
+```
+
+Image uploads are limited to 50 MB; PDF and video uploads to 20 MB. Detection takes the files Etchv
+delivered: up to 192 MB for images, 64 MB for PDFs and 100 MB for video.
+
+## Large files
+
+Files over 40 MB are uploaded once to a signed URL and then referenced by ID, so the request never
+carries the file. This is automatic in every embed, detect and submit method; retries reuse the same
+upload. Image and PDF detection above 95 MB runs as a background job and the call waits for it.
+Change the threshold with `new EtchvClient(apiKey, baseUrl, timeout, largeFileThreshold)`, or upload
+explicitly:
+
+```java
+var upload = client.uploadFile("detect", delivered, "delivered.tiff");
+upload.uploadId(); // send as the upload_id form field instead of file
 ```
 
 ## GPU processing
