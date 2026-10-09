@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.1.0";
+  public static final String VERSION = "1.2.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -74,6 +74,24 @@ public final class EtchvClient implements AutoCloseable {
 
   /** Maximum response or result file size, in bytes (256 MB). */
   public static final int MAX_DOWNLOAD_SIZE = 256 * 1024 * 1024;
+
+  /** Maximum number of files in one batch (100). */
+  public static final int MAX_BATCH_ITEMS = 100;
+
+  /** Maximum size of a zip sent to {@link #submitBatchZip}, in bytes (55 MB). */
+  public static final int MAX_BATCH_ZIP_SIZE = 55 * 1024 * 1024;
+
+  /**
+   * Maximum size of a batch archive read by {@link #downloadBatchArchive}, in bytes: the API's
+   * 1 GB of results plus 64 MB for zip overhead and the manifest.
+   */
+  public static final long MAX_BATCH_ARCHIVE_SIZE = 1024L * 1024 * 1024 + 64L * 1024 * 1024;
+
+  /** Default number of files uploaded at once by {@link #submitBatch}. */
+  public static final int DEFAULT_UPLOAD_CONCURRENCY = 4;
+
+  /** Default wait of {@link #waitForBatch} when no timeout is given (one hour). */
+  public static final Duration DEFAULT_BATCH_TIMEOUT = Duration.ofHours(1);
 
   /** Maximum age of a webhook timestamp accepted by {@link #verifyWebhookSignature}. */
   public static final Duration WEBHOOK_TOLERANCE = Duration.ofMinutes(5);
@@ -321,8 +339,10 @@ public final class EtchvClient implements AutoCloseable {
    */
   public enum Accelerator {
     /** CPU processing (the API default). */
+    @SerializedName("cpu")
     CPU("cpu"),
     /** GPU processing (Business or Enterprise plans). */
+    @SerializedName("gpu")
     GPU("gpu");
 
     private final String value;
@@ -665,6 +685,8 @@ public final class EtchvClient implements AutoCloseable {
   private static final Pattern EVENT_ID = Pattern.compile("evt_[a-f0-9]{64}");
   private static final Pattern DESTINATION_ID = Pattern.compile("dst_[a-f0-9]{32}");
   private static final Pattern DELIVERY_ID = Pattern.compile("std_[a-f0-9]{64}");
+  private static final Pattern BATCH_ID = Pattern.compile("bat_[a-f0-9]{32}");
+  private static final Pattern IDEMPOTENCY_KEY = Pattern.compile("[A-Za-z0-9_-]{8,128}");
   private static final Set<String> MEDIA = Set.of("images", "documents", "videos");
   private static final Set<String> ASSET_FILTERS =
       Set.of("limit", "cursor", "kind", "media_type", "watermark_id");
@@ -790,7 +812,6 @@ public final class EtchvClient implements AutoCloseable {
       throw new IllegalArgumentException("kind must be image, document, video or detect");
     if (file == null || file.length == 0)
       throw new IllegalArgumentException("file must contain at least 1 byte");
-    long started = System.nanoTime();
     var request = new LinkedHashMap<String, Object>();
     request.put("kind", kind);
     request.put("filename", filename == null ? "file" : filename);
@@ -799,55 +820,164 @@ public final class EtchvClient implements AutoCloseable {
     URI url;
     try {
       var upload = session.getAsJsonObject("upload");
-      if (!"PUT".equals(upload.get("method").getAsString())) throw new IllegalStateException();
-      url = URI.create(upload.get("url").getAsString());
-      if (!("https".equals(url.getScheme())
-          || ("http".equals(url.getScheme())
-              && Set.of("localhost", "127.0.0.1", "[::1]").contains(url.getHost()))))
-        throw new IllegalStateException();
+      url = signedUrl(upload.get("method").getAsString(), upload.get("url").getAsString());
     } catch (RuntimeException e) {
       throw new EtchvException(201, "Invalid upload session response", null, null);
     }
-    IOException lastFailure = null;
-    while (System.nanoTime() - started < timeout.toNanos()) {
+    putSigned(url, () -> HttpRequest.BodyPublishers.ofByteArray(file));
+    try {
+      return new UploadSession(
+          session.get("upload_id").getAsString(),
+          session.get("kind").getAsString(),
+          session.get("filename").getAsString(),
+          session.get("size").getAsLong(),
+          "received",
+          session.has("expires_at") ? session.get("expires_at").getAsString() : null);
+    } catch (RuntimeException e) {
+      throw new EtchvException(201, "Invalid upload session response", null, null);
+    }
+  }
+
+  /** A signed PUT URL from the API: HTTPS (HTTP only for localhost). */
+  private static URI signedUrl(String method, String url) {
+    var uri = URI.create(url);
+    if (!"PUT".equals(method)
+        || !("https".equals(uri.getScheme())
+            || ("http".equals(uri.getScheme())
+                && Set.of("localhost", "127.0.0.1", "[::1]").contains(uri.getHost()))))
+      throw new IllegalArgumentException("Invalid upload URL");
+    return uri;
+  }
+
+  /** Supplies a fresh request body for every attempt (a file is reopened on a retry). */
+  private interface BodySource {
+    HttpRequest.BodyPublisher open() throws IOException;
+  }
+
+  /**
+   * PUTs a file to a signed URL. The signed URL carries its own authorization: the API key is
+   * never sent.
+   *
+   * <p>Each attempt runs under an idle timeout rather than a total deadline: it fails only when no
+   * request body is sent and no response arrives for the client timeout, so a large file on a slow
+   * link keeps going while bytes flow. Transport failures and HTTP 500/502/503/504 are retried
+   * (pausing 1 s) for up to the client timeout measured from the first failure.
+   */
+  private void putSigned(URI url, BodySource body) throws InterruptedException {
+    long firstFailure = 0;
+    boolean failing = false;
+    Exception lastFailure = null;
+    while (true) {
       if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+      HttpRequest.BodyPublisher publisher;
+      try {
+        publisher = body.open();
+      } catch (IOException e) {
+        throw new EtchvException(0, "Cannot read the file: " + e.getMessage(), null, null, e);
+      }
+      var progress = new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
       var put =
           HttpRequest.newBuilder(url)
               .header("User-Agent", USER_AGENT)
               .header("Content-Type", "application/octet-stream")
-              .timeout(
-                  Duration.ofNanos(Math.max(1, timeout.toNanos() - (System.nanoTime() - started))))
-              .PUT(HttpRequest.BodyPublishers.ofByteArray(file))
+              .PUT(new ProgressPublisher(publisher, progress))
               .build();
-      HttpResponse<byte[]> response;
+      var future = http.sendAsync(put, ignored -> new LimitedBody());
+      HttpResponse<byte[]> response = null;
       try {
-        response = http.send(put, ignored -> new LimitedBody());
+        response = awaitIdle(future, progress);
       } catch (IOException e) {
         lastFailure = e;
-        pause(started, 1);
-        continue;
       }
-      int status = response.statusCode();
-      if (status == 200) {
+      if (response != null) {
+        int status = response.statusCode();
+        if (status == 200) return;
+        if (!Set.of(500, 502, 503, 504).contains(status))
+          throw new EtchvException(status, bounded(response.body()), null, null);
+        lastFailure = new EtchvException(status, bounded(response.body()), null, null);
+      }
+      long now = System.nanoTime();
+      if (!failing) {
+        failing = true;
+        firstFailure = now;
+      }
+      long remaining = timeout.toNanos() - (now - firstFailure);
+      if (remaining <= 0) {
+        if (lastFailure instanceof EtchvException e) throw e;
+        throw new EtchvException(
+            0, "Client deadline exceeded; the upload did not complete", null, null, lastFailure);
+      }
+      TimeUnit.NANOSECONDS.sleep(Math.min(remaining, 1_000_000_000L));
+    }
+  }
+
+  /**
+   * Waits for an exchange while it makes progress: fails with an {@link HttpTimeoutException} once
+   * nothing was sent or received for the client timeout.
+   */
+  private HttpResponse<byte[]> awaitIdle(
+      CompletableFuture<HttpResponse<byte[]>> future, java.util.concurrent.atomic.AtomicLong progress)
+      throws IOException, InterruptedException {
+    long idle = timeout.toNanos();
+    try {
+      while (true) {
+        long wait = idle - (System.nanoTime() - progress.get());
+        if (wait <= 0) {
+          future.cancel(true);
+          throw new HttpTimeoutException("No upload progress for " + timeout);
+        }
         try {
-          return new UploadSession(
-              session.get("upload_id").getAsString(),
-              session.get("kind").getAsString(),
-              session.get("filename").getAsString(),
-              session.get("size").getAsLong(),
-              "received",
-              session.has("expires_at") ? session.get("expires_at").getAsString() : null);
-        } catch (RuntimeException e) {
-          throw new EtchvException(201, "Invalid upload session response", null, null);
+          return future.get(wait, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException ignored) {
+          // Check progress again.
         }
       }
-      if (Set.of(500, 502, 503, 504).contains(status)) {
-        pause(started, 1);
-        continue;
-      }
-      throw new EtchvException(status, bounded(response.body()), null, null);
+    } catch (ExecutionException e) {
+      if (e.getCause() instanceof IOException io) throw io;
+      throw new IOException(e.getCause());
+    } catch (InterruptedException e) {
+      future.cancel(true);
+      throw e;
     }
-    throw new EtchvException(0, "Client deadline exceeded", null, null, lastFailure);
+  }
+
+  /** A request body that records when the HTTP client last took bytes from it. */
+  private record ProgressPublisher(
+      HttpRequest.BodyPublisher delegate, java.util.concurrent.atomic.AtomicLong progress)
+      implements HttpRequest.BodyPublisher {
+    @Override
+    public long contentLength() {
+      return delegate.contentLength();
+    }
+
+    @Override
+    public void subscribe(Flow.Subscriber<? super ByteBuffer> subscriber) {
+      delegate.subscribe(
+          new Flow.Subscriber<ByteBuffer>() {
+            @Override
+            public void onSubscribe(Flow.Subscription subscription) {
+              progress.set(System.nanoTime());
+              subscriber.onSubscribe(subscription);
+            }
+
+            @Override
+            public void onNext(ByteBuffer item) {
+              progress.set(System.nanoTime());
+              subscriber.onNext(item);
+            }
+
+            @Override
+            public void onError(Throwable error) {
+              subscriber.onError(error);
+            }
+
+            @Override
+            public void onComplete() {
+              progress.set(System.nanoTime());
+              subscriber.onComplete();
+            }
+          });
+    }
   }
 
   // ---------------------------------------------------------------- Connection check
@@ -1444,7 +1574,7 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Retries a failed or cancelled storage delivery ({@code POST /storage/deliveries/{id}/retry}).
+   * Retries a failed or canceled storage delivery ({@code POST /storage/deliveries/{id}/retry}).
    * Does not watermark again or consume credits.
    *
    * @param id delivery ID ({@code std_…})
@@ -1467,6 +1597,1212 @@ public final class EtchvClient implements AutoCloseable {
    */
   public byte[] downloadStorageDelivery(String id) throws InterruptedException {
     return send(deliveryPath(id) + "/content", "GET", null).body();
+  }
+
+  // ---------------------------------------------------------------- Batches
+
+  /**
+   * One file of a batch: its name, its forensic data, and its content as bytes or a path.
+   *
+   * <p>Create items with {@link #of(String, byte[], Map)}, {@link #of(Path, Map)} or {@link
+   * #of(String, Path, Map)}. A path is streamed from disk when uploaded, so large batches need not
+   * be held in memory.
+   *
+   * @param filename file name (1–255 characters); its extension sets the media type
+   * @param file file bytes, or null when {@code path} is set
+   * @param path file on disk, or null when {@code file} is set
+   * @param data non-empty forensic JSON object for this file
+   */
+  public record BatchItem(String filename, byte[] file, java.nio.file.Path path, Map<String, ?> data) {
+    /**
+     * An item from bytes.
+     *
+     * @param filename file name; its extension sets the media type
+     * @param file file bytes
+     * @param data non-empty forensic JSON object
+     * @return the item
+     */
+    public static BatchItem of(String filename, byte[] file, Map<String, ?> data) {
+      return new BatchItem(filename, file, null, data);
+    }
+
+    /**
+     * An item from a file on disk, named after the file.
+     *
+     * @param path file to upload
+     * @param data non-empty forensic JSON object
+     * @return the item
+     */
+    public static BatchItem of(java.nio.file.Path path, Map<String, ?> data) {
+      var name = path == null ? null : path.getFileName();
+      return new BatchItem(name == null ? null : name.toString(), null, path, data);
+    }
+
+    /**
+     * An item from a file on disk with another name.
+     *
+     * @param filename file name; its extension sets the media type
+     * @param path file to upload
+     * @param data non-empty forensic JSON object
+     * @return the item
+     */
+    public static BatchItem of(String filename, java.nio.file.Path path, Map<String, ?> data) {
+      return new BatchItem(filename, null, path, data);
+    }
+  }
+
+  /**
+   * One member of a zip sent to {@link #submitBatchZip}.
+   *
+   * @param filename the member's path inside the zip, exactly as stored
+   * @param data non-empty forensic JSON object for this file
+   */
+  public record BatchZipItem(String filename, Map<String, ?> data) {}
+
+  /**
+   * Options for {@link #submitBatch} and {@link #submitBatchZip}. Start from {@link
+   * #BatchOptions()} and use the {@code with…} methods.
+   *
+   * @param archive also zip every result into one download ({@link #downloadBatchArchive})
+   * @param webhookId webhook endpoint ({@code wh_…}) that receives one {@code watermark.batch.*}
+   *     event when the batch ends, or null
+   * @param accelerator requested processing hardware for every file, or null (CPU)
+   * @param storageDestinationId verified storage destination ({@code dst_…}) for every result, or
+   *     null; not allowed with {@code archive}
+   * @param idempotencyKey key that makes resubmitting safe (8–128 letters, digits, hyphens or
+   *     underscores); generated when null
+   * @param uploadConcurrency files uploaded at once (at least 1; ignored by {@link
+   *     #submitBatchZip})
+   */
+  public record BatchOptions(
+      boolean archive,
+      String webhookId,
+      Accelerator accelerator,
+      String storageDestinationId,
+      String idempotencyKey,
+      int uploadConcurrency) {
+    /** Default options: no archive, no webhook, CPU, four uploads at once. */
+    public BatchOptions() {
+      this(false, null, null, null, null, DEFAULT_UPLOAD_CONCURRENCY);
+    }
+
+    /**
+     * Returns a copy that also builds a zip of every result.
+     *
+     * @param archive whether to build the archive
+     * @return new options
+     */
+    public BatchOptions withArchive(boolean archive) {
+      return new BatchOptions(
+          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+    }
+
+    /**
+     * Returns a copy with a webhook endpoint.
+     *
+     * @param webhookId endpoint ID ({@code wh_…}), or null
+     * @return new options
+     */
+    public BatchOptions withWebhookId(String webhookId) {
+      return new BatchOptions(
+          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+    }
+
+    /**
+     * Returns a copy with an accelerator.
+     *
+     * @param accelerator requested processing hardware, or null
+     * @return new options
+     */
+    public BatchOptions withAccelerator(Accelerator accelerator) {
+      return new BatchOptions(
+          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+    }
+
+    /**
+     * Returns a copy with a storage destination.
+     *
+     * @param storageDestinationId destination ID ({@code dst_…}), or null
+     * @return new options
+     */
+    public BatchOptions withStorageDestinationId(String storageDestinationId) {
+      return new BatchOptions(
+          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+    }
+
+    /**
+     * Returns a copy with an idempotency key.
+     *
+     * @param idempotencyKey 8–128 letters, digits, hyphens or underscores, or null to generate
+     * @return new options
+     */
+    public BatchOptions withIdempotencyKey(String idempotencyKey) {
+      return new BatchOptions(
+          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+    }
+
+    /**
+     * Returns a copy with another upload concurrency.
+     *
+     * @param uploadConcurrency files uploaded at once (at least 1)
+     * @return new options
+     */
+    public BatchOptions withUploadConcurrency(int uploadConcurrency) {
+      return new BatchOptions(
+          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+    }
+  }
+
+  /**
+   * Item counts of a batch.
+   *
+   * @param pending files not yet admitted
+   * @param accepted files admitted and charged
+   * @param rejected files refused at admission (never charged)
+   * @param succeeded files watermarked
+   * @param failed admitted files that failed (refunded)
+   * @param inProgress admitted files not yet finished
+   */
+  public record BatchCounts(
+      int pending, int accepted, int rejected, int succeeded, int failed, int inProgress) {}
+
+  /**
+   * Credits of a batch.
+   *
+   * @param reserved credits held for files still running
+   * @param charged credits charged for succeeded files
+   * @param refunded credits returned for failed files
+   */
+  public record BatchCredits(int reserved, int charged, int refunded) {}
+
+  /**
+   * Where to PUT a pending file of a draft batch.
+   *
+   * @param method always {@code PUT}
+   * @param url signed upload URL; never send the API key to it
+   * @param expiresAt when the URL expires (ISO 8601)
+   */
+  public record BatchUpload(String method, String url, String expiresAt) {}
+
+  /**
+   * One file of a batch as the API reports it.
+   *
+   * @param index zero-based position in the batch
+   * @param filename file name
+   * @param size declared size in bytes, or null for a zip batch
+   * @param uploadId upload session ({@code upl_…}), or null
+   * @param requestId job ID ({@code req_…}) once admitted, or null
+   * @param status {@code pending}, {@code rejected}, {@code queued}, {@code running}, {@code
+   *     retrying}, {@code succeeded} or {@code failed}
+   * @param errorCode why the file was rejected or failed, such as {@code upload_not_received},
+   *     {@code upload_size_mismatch}, {@code invalid_input}, {@code insufficient_credits} or {@code
+   *     cancelled}; null otherwise
+   * @param errorDetail human-readable detail of the error, or null
+   * @param credits credits reserved or charged for this file (0 when refunded), or null before
+   *     admission
+   * @param statusUrl job receipt path, or null
+   * @param resultUrl job result path, or null
+   * @param resultExpiresAt when the result expires (ISO 8601), or null
+   * @param upload where to upload the file while the batch is a draft, or null
+   * @param uploadReceived whether the file already arrived (then {@code upload} is null); never
+   *     null (a missing or null value reads as false)
+   */
+  public record BatchItemStatus(
+      int index,
+      String filename,
+      Long size,
+      String uploadId,
+      String requestId,
+      String status,
+      String errorCode,
+      String errorDetail,
+      Integer credits,
+      String statusUrl,
+      String resultUrl,
+      String resultExpiresAt,
+      BatchUpload upload,
+      Boolean uploadReceived) {
+    /** Reads a missing or null {@code upload_received} as false. */
+    public BatchItemStatus {
+      uploadReceived = Boolean.TRUE.equals(uploadReceived);
+    }
+  }
+
+  /**
+   * A batch of up to 100 files.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @param status {@code draft}, {@code starting}, {@code processing}, {@code assembling}, or
+   *     terminal {@code completed} (at least one file succeeded), {@code failed}, {@code cancelled}
+   *     or {@code expired} (a draft never started)
+   * @param itemCount number of files
+   * @param archive whether a zip of every result is built
+   * @param accelerator requested processing hardware
+   * @param webhookId webhook endpoint, or null
+   * @param storageDestinationId storage destination, or null
+   * @param counts item counts
+   * @param credits reserved, charged and refunded credits
+   * @param cancelRequested whether the batch was canceled
+   * @param createdAt creation time (ISO 8601)
+   * @param startedAt start time, or null
+   * @param completedAt end time, or null
+   * @param uploadExpiresAt when a draft expires (ISO 8601)
+   * @param statusUrl path of this batch
+   * @param archiveStatus archive state with {@code archive}, or null
+   * @param archiveUrl archive path with {@code archive}, or null
+   * @param archiveExpiresAt when the archive expires, or null
+   * @param items every file in index order; empty in {@link #listBatches} pages
+   */
+  public record Batch(
+      String batchId,
+      String status,
+      int itemCount,
+      boolean archive,
+      Accelerator accelerator,
+      String webhookId,
+      String storageDestinationId,
+      BatchCounts counts,
+      BatchCredits credits,
+      boolean cancelRequested,
+      String createdAt,
+      String startedAt,
+      String completedAt,
+      String uploadExpiresAt,
+      String statusUrl,
+      String archiveStatus,
+      String archiveUrl,
+      String archiveExpiresAt,
+      List<BatchItemStatus> items) {
+    /** Normalizes a missing item list to an empty one. */
+    public Batch {
+      items = items == null ? List.of() : List.copyOf(items);
+    }
+
+    /**
+     * Whether the batch reached a final state: {@code completed}, {@code failed}, {@code
+     * cancelled} or {@code expired}.
+     *
+     * @return true when nothing more will change
+     */
+    public boolean isDone() {
+      return Set.of("completed", "failed", "cancelled", "expired").contains(status);
+    }
+  }
+
+  /**
+   * A page of batches.
+   *
+   * @param items batches without their items, newest first
+   * @param nextCursor batch ID to pass as {@code before} for the next page, or null at the end
+   */
+  public record BatchPage(@SerializedName("data") List<Batch> items, String nextCursor) {}
+
+  /**
+   * The outcome of one file of a batch, from {@link #batchResults}.
+   *
+   * @param index zero-based position in the batch
+   * @param filename file name
+   * @param status the file's status, such as {@code succeeded}, {@code failed} or {@code rejected}
+   * @param requestId job ID, or null when the file was never admitted
+   * @param errorCode why the file was rejected or failed, or null
+   * @param errorDetail human-readable detail, or null
+   * @param credits credits charged (0 when refunded), or null
+   * @param result the watermarked file for a succeeded item, or null
+   * @param error the failure downloading a succeeded item's result, or null
+   */
+  public record BatchItemResult(
+      int index,
+      String filename,
+      String status,
+      String requestId,
+      String errorCode,
+      String errorDetail,
+      Integer credits,
+      EmbedResult result,
+      EtchvException error) {
+    /**
+     * Whether the file was watermarked and its result downloaded.
+     *
+     * @return true when {@link #result()} is set
+     */
+    public boolean ok() {
+      return result != null;
+    }
+  }
+
+  /**
+   * Submits up to 100 files with their own forensic data as one batch and starts it.
+   *
+   * <p>Creates the batch ({@code POST /watermarks/batches}) with an idempotency key, uploads every
+   * file to its signed URL ({@link BatchOptions#uploadConcurrency()} at a time; the API key is
+   * never sent there), then starts it ({@code POST /watermarks/batches/{id}/start}). Files are
+   * then checked and charged one by one; rejected files are never charged. Wait with {@link
+   * #waitForBatch} and read the outcomes with {@link #batchResults}.
+   *
+   * <p>If an upload fails, the exception carries the idempotency key: submitting the same items
+   * again with that key resumes the same batch and uploads only the files still pending.
+   *
+   * @param items 1–100 files
+   * @param options batch options, or null for the defaults
+   * @return the started batch
+   * @throws IllegalArgumentException for more than 100 files or an invalid item or option
+   * @throws EtchvException on API, upload, transport or deadline failure; HTTP 503 when uploads
+   *     are unavailable (use {@link #submitBatchZip})
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Batch submitBatch(List<BatchItem> items, BatchOptions options)
+      throws InterruptedException {
+    if (items == null || items.isEmpty() || items.size() > MAX_BATCH_ITEMS)
+      throw new IllegalArgumentException(
+          "A batch takes 1 to " + MAX_BATCH_ITEMS + " files; split larger sets into several batches");
+    if (options == null) options = new BatchOptions();
+    if (options.uploadConcurrency() < 1)
+      throw new IllegalArgumentException("uploadConcurrency must be at least 1");
+    String idempotency = batchKey(options);
+    var sizes = new long[items.size()];
+    var manifest = new ArrayList<Map<String, Object>>();
+    for (int i = 0; i < items.size(); i++) {
+      var item = items.get(i);
+      if (item == null) throw new IllegalArgumentException("Batch item " + i + " is null");
+      checkBatchFile(i, item.filename(), item.data());
+      if ((item.file() == null) == (item.path() == null))
+        throw new IllegalArgumentException("Batch item " + i + " needs either file bytes or a path");
+      try {
+        sizes[i] = item.file() != null ? item.file().length : java.nio.file.Files.size(item.path());
+      } catch (IOException e) {
+        throw new UncheckedIOException("Cannot read " + item.path(), e);
+      }
+      if (sizes[i] == 0) throw new IllegalArgumentException("Batch item " + i + " is empty");
+      var entry = new LinkedHashMap<String, Object>();
+      entry.put("filename", item.filename());
+      entry.put("size", sizes[i]);
+      entry.put("data", item.data());
+      manifest.add(entry);
+    }
+    var body = batchBody(options);
+    body.put("items", manifest);
+    var response =
+        call(
+            "POST",
+            "watermarks/batches",
+            "application/json",
+            JSON.toJson(body).getBytes(StandardCharsets.UTF_8),
+            idempotency,
+            false,
+            false,
+            MAX_DOWNLOAD_SIZE);
+    var created = parseBatch(response);
+    String requestId = response.headers().firstValue("X-Request-ID").orElse(null);
+    if ("expired".equals(created.status())) {
+      // Reported like the API's own 410, with a code to branch on.
+      var detail = new LinkedHashMap<String, Object>();
+      detail.put("code", "batch_expired");
+      detail.put(
+          "message",
+          "Batch "
+              + created.batchId()
+              + " expired before it was started (24 hours); submit with a new idempotency key");
+      throw new EtchvException(410, JSON.toJson(Map.of("detail", detail)), requestId, idempotency);
+    }
+    if (!"draft".equals(created.status())) return created; // A replay of a batch that already started.
+    String path = batchPath(created.batchId());
+    var pending = new ConcurrentLinkedQueue<BatchItemStatus>();
+    for (var item : created.items()) {
+      if (Boolean.TRUE.equals(item.uploadReceived())) continue; // Already received on a replay.
+      if (item.upload() == null)
+        throw new EtchvException(
+            response.statusCode(),
+            "Invalid batch upload response: item "
+                + item.index()
+                + " ("
+                + item.filename()
+                + ") has no upload URL and was not received",
+            requestId,
+            idempotency);
+      try {
+        if (item.index() < 0 || item.index() >= items.size()) throw new IllegalArgumentException();
+        signedUrl(item.upload().method(), item.upload().url());
+      } catch (RuntimeException e) {
+        throw new EtchvException(
+            response.statusCode(), "Invalid batch upload response", requestId, idempotency);
+      }
+      pending.add(item);
+    }
+    uploadBatch(created.batchId(), items, sizes, pending, options.uploadConcurrency(), idempotency);
+    return parseBatch(call("POST", path + "/start", null, null, idempotency, true, false, MAX_DOWNLOAD_SIZE));
+  }
+
+  /**
+   * Creates and starts a batch from one zip whose members are the batch's files ({@code POST
+   * /watermarks/batches/zip}). For files that are already together; no separate uploads.
+   *
+   * @param zip zip bytes (1 byte to 55 MB)
+   * @param items one entry for every member (1–100), naming it exactly as stored
+   * @param options batch options, or null; {@code uploadConcurrency} does not apply
+   * @return the batch, already starting
+   * @throws IllegalArgumentException for an invalid zip size, item or option
+   * @throws EtchvException on API, transport or deadline failure; 422 when the manifest and the
+   *     zip disagree, 413 for an oversized member
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Batch submitBatchZip(byte[] zip, List<BatchZipItem> items, BatchOptions options)
+      throws InterruptedException {
+    if (zip == null || zip.length == 0 || zip.length > MAX_BATCH_ZIP_SIZE)
+      throw new IllegalArgumentException(
+          "zip must contain 1 byte to " + MAX_BATCH_ZIP_SIZE / (1024 * 1024) + " MB");
+    if (items == null || items.isEmpty() || items.size() > MAX_BATCH_ITEMS)
+      throw new IllegalArgumentException(
+          "A batch takes 1 to " + MAX_BATCH_ITEMS + " files; split larger sets into several batches");
+    if (options == null) options = new BatchOptions();
+    String idempotency = batchKey(options);
+    var manifest = new ArrayList<Map<String, Object>>();
+    for (int i = 0; i < items.size(); i++) {
+      var item = items.get(i);
+      if (item == null) throw new IllegalArgumentException("Batch item " + i + " is null");
+      checkBatchFile(i, item.filename(), item.data());
+      var entry = new LinkedHashMap<String, Object>();
+      entry.put("filename", item.filename());
+      entry.put("data", item.data());
+      manifest.add(entry);
+    }
+    var body = batchBody(options);
+    body.put("items", manifest);
+    String boundary = "etchv-" + UUID.randomUUID();
+    var out = new ByteArrayOutputStream();
+    out.writeBytes(
+        ("--"
+                + boundary
+                + "\r\nContent-Disposition: form-data; name=\"manifest\"\r\n"
+                + "Content-Type: application/json\r\n\r\n"
+                + JSON.toJson(body)
+                + "\r\n--"
+                + boundary
+                + "\r\nContent-Disposition: form-data; name=\"archive\"; filename=\"batch.zip\"\r\n"
+                + "Content-Type: application/zip\r\n\r\n")
+            .getBytes(StandardCharsets.UTF_8));
+    out.writeBytes(zip);
+    out.writeBytes(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+    return parseBatch(
+        call(
+            "POST",
+            "watermarks/batches/zip",
+            "multipart/form-data; boundary=" + boundary,
+            out.toByteArray(),
+            idempotency,
+            false,
+            false,
+            MAX_DOWNLOAD_SIZE));
+  }
+
+  /**
+   * Creates and starts a batch from a zip file on disk.
+   *
+   * @param zip zip file (1 byte to 55 MB)
+   * @param items one entry for every member, naming it exactly as stored
+   * @param options batch options, or null
+   * @return the batch, already starting
+   * @throws UncheckedIOException if the zip cannot be read
+   * @throws EtchvException on API, transport or deadline failure
+   * @throws InterruptedException if the thread is interrupted
+   * @see #submitBatchZip(byte[], List, BatchOptions)
+   */
+  public Batch submitBatchZip(java.nio.file.Path zip, List<BatchZipItem> items, BatchOptions options)
+      throws InterruptedException {
+    byte[] bytes;
+    try {
+      if (java.nio.file.Files.size(zip) > MAX_BATCH_ZIP_SIZE)
+        throw new IllegalArgumentException(
+            "zip must contain 1 byte to " + MAX_BATCH_ZIP_SIZE / (1024 * 1024) + " MB");
+      bytes = java.nio.file.Files.readAllBytes(zip);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Cannot read " + zip, e);
+    }
+    return submitBatchZip(bytes, items, options);
+  }
+
+  /**
+   * Reads a batch with every file's status ({@code GET /watermarks/batches/{id}}).
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @return the batch
+   * @throws EtchvException 404 for an unknown batch
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Batch getBatch(String batchId) throws InterruptedException {
+    return parseBatch(call("GET", batchPath(batchId), null, null, null, true, false, MAX_DOWNLOAD_SIZE));
+  }
+
+  /**
+   * Polls a batch until it is done ({@link Batch#isDone()}), one request per poll, waiting as long
+   * as the API's {@code Retry-After} asks between polls (at least 1 s; 2 s when absent).
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @param timeout how long to wait; null or zero for {@link #DEFAULT_BATCH_TIMEOUT}
+   * @return the finished batch
+   * @throws EtchvException status 0 with a {@link TimeoutException} cause when the batch is still
+   *     running at the timeout; API and transport failures otherwise
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Batch waitForBatch(String batchId, Duration timeout) throws InterruptedException {
+    String path = batchPath(batchId);
+    if (timeout == null || timeout.isZero()) timeout = DEFAULT_BATCH_TIMEOUT;
+    if (timeout.isNegative()) throw new IllegalArgumentException("timeout must be positive");
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (true) {
+      var response = call("GET", path, null, null, null, true, false, MAX_DOWNLOAD_SIZE);
+      var batch = parseBatch(response);
+      if (batch.isDone()) return batch;
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0)
+        throw new EtchvException(
+            0,
+            "Batch " + batchId + " is still " + batch.status() + " after " + timeout,
+            null,
+            null,
+            new TimeoutException("waitForBatch timed out"));
+      TimeUnit.NANOSECONDS.sleep(Math.min(remaining, pollDelayNanos(response)));
+    }
+  }
+
+  /**
+   * Waits up to {@link #DEFAULT_BATCH_TIMEOUT} for a batch to finish, then streams the outcome of
+   * every file.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @return a sequential stream with one result per file
+   * @throws EtchvException when the batch cannot be read or is still running after an hour
+   * @throws InterruptedException if the thread is interrupted
+   * @see #batchResults(String, Duration)
+   */
+  public java.util.stream.Stream<BatchItemResult> batchResults(String batchId)
+      throws InterruptedException {
+    return batchResults(batchId, null);
+  }
+
+  /**
+   * Waits for a batch to finish ({@link #waitForBatch}), then streams the outcome of every file in
+   * index order. The result of each succeeded file is downloaded ({@link #getEmbedResult}) lazily
+   * as the stream reaches it; results are kept 24 hours.
+   *
+   * <p>Other files carry an {@code errorCode}: their own, or {@code cancelled} or {@code expired}
+   * when the batch ended that way before they ran, or else their status. Their credits are
+   * refunded. A failed download is reported in {@link BatchItemResult#error()} rather than thrown.
+   * If the thread is interrupted while the stream downloads, the stream throws an {@link
+   * EtchvException} whose cause is the {@link InterruptedException}, with the interrupt flag
+   * restored.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @param timeout how long to wait for the batch; null or zero for {@link #DEFAULT_BATCH_TIMEOUT}
+   * @return a sequential stream with one result per file
+   * @throws EtchvException when the batch cannot be read, or status 0 with a {@link
+   *     TimeoutException} cause when it is still running at the timeout
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public java.util.stream.Stream<BatchItemResult> batchResults(String batchId, Duration timeout)
+      throws InterruptedException {
+    var batch = waitForBatch(batchId, timeout);
+    boolean ended = "cancelled".equals(batch.status()) || "expired".equals(batch.status());
+    return batch.items().stream()
+        .map(
+            item -> {
+              EmbedResult result = null;
+              EtchvException error = null;
+              String code = null;
+              if ("succeeded".equals(item.status()) && item.requestId() != null) {
+                try {
+                  result = getEmbedResult(item.requestId());
+                } catch (EtchvException | IllegalArgumentException e) {
+                  error =
+                      e instanceof EtchvException etchv
+                          ? etchv
+                          : new EtchvException(0, e.getMessage(), item.requestId(), null, e);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  throw new EtchvException(0, "Interrupted", item.requestId(), null, e);
+                }
+              } else
+                code =
+                    item.errorCode() != null
+                        ? item.errorCode()
+                        : ended ? batch.status() : item.status();
+              return new BatchItemResult(
+                  item.index(),
+                  item.filename(),
+                  item.status(),
+                  item.requestId(),
+                  code,
+                  item.errorDetail(),
+                  item.credits(),
+                  result,
+                  error);
+            });
+  }
+
+  /**
+   * Downloads the zip of a batch created with {@code archive}, waiting up to {@link
+   * #DEFAULT_BATCH_TIMEOUT} while it is assembled.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @return zip bytes
+   * @throws EtchvException see {@link #downloadBatchArchive(String, OutputStream, Duration)}
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public byte[] downloadBatchArchive(String batchId) throws InterruptedException {
+    return downloadBatchArchive(batchId, (Duration) null);
+  }
+
+  /**
+   * Downloads the zip of a batch created with {@code archive} into memory. Prefer {@link
+   * #downloadBatchArchive(String, java.nio.file.Path, Duration)} for large archives.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @param timeout how long to wait while the archive is assembled; null or zero for {@link
+   *     #DEFAULT_BATCH_TIMEOUT}
+   * @return zip bytes
+   * @throws EtchvException see {@link #downloadBatchArchive(String, OutputStream, Duration)}
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public byte[] downloadBatchArchive(String batchId, Duration timeout)
+      throws InterruptedException {
+    var buffer = new ByteArrayOutputStream();
+    downloadBatchArchive(batchId, buffer, timeout);
+    return buffer.toByteArray();
+  }
+
+  /**
+   * Downloads the zip of a batch created with {@code archive} to a file. The zip is written to a
+   * temporary file in the same directory and moved into place once complete.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @param destination file to create or replace
+   * @param timeout how long to wait while the archive is assembled; null or zero for {@link
+   *     #DEFAULT_BATCH_TIMEOUT}
+   * @return number of bytes written
+   * @throws UncheckedIOException if the file cannot be written
+   * @throws EtchvException see {@link #downloadBatchArchive(String, OutputStream, Duration)}
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public long downloadBatchArchive(
+      String batchId, java.nio.file.Path destination, Duration timeout)
+      throws InterruptedException {
+    batchPath(batchId);
+    var absolute = Objects.requireNonNull(destination, "destination").toAbsolutePath();
+    java.nio.file.Path temporary;
+    try {
+      temporary =
+          java.nio.file.Files.createTempFile(absolute.getParent(), ".etchv-archive-", ".zip");
+    } catch (IOException e) {
+      throw new UncheckedIOException("Cannot write " + destination, e);
+    }
+    boolean moved = false;
+    try {
+      long written;
+      try (var out = java.nio.file.Files.newOutputStream(temporary)) {
+        written = downloadBatchArchive(batchId, out, timeout);
+      } catch (IOException e) {
+        throw new UncheckedIOException("Cannot write " + destination, e);
+      }
+      try {
+        try {
+          java.nio.file.Files.move(
+              temporary,
+              absolute,
+              java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+              java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+          java.nio.file.Files.move(
+              temporary, absolute, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException("Cannot write " + destination, e);
+      }
+      moved = true;
+      return written;
+    } finally {
+      if (!moved)
+        try {
+          java.nio.file.Files.deleteIfExists(temporary);
+        } catch (IOException ignored) {
+          // Best effort.
+        }
+    }
+  }
+
+  /**
+   * Downloads the zip of every successful result of a batch created with {@code archive} ({@code
+   * GET /watermarks/batches/{id}/archive}) and writes it to {@code destination}. The zip holds
+   * {@code NNN-<name>-watermarked.<ext>} entries and a {@code manifest.json} listing files and
+   * failures.
+   *
+   * <p>While the archive is assembled (HTTP 202) the call polls, honoring {@code Retry-After} (at least 1 s),
+   * until {@code timeout}; HTTP 429, 502, 503 and 504 and network failures are retried within the
+   * same wait. Each request must answer within the client timeout, and the download fails if no
+   * bytes arrive for the client timeout, however long the whole download takes.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @param destination stream that receives the zip; not closed
+   * @param timeout how long to wait while the archive is assembled; null or zero for {@link
+   *     #DEFAULT_BATCH_TIMEOUT}
+   * @return number of bytes written
+   * @throws EtchvException 409 with {@code code()} {@code batch_not_started}, {@code
+   *     archive_not_requested}, {@code archive_too_large} or {@code archive_unavailable}; 410 after
+   *     24 hours or for an expired draft; status 0 with a {@link TimeoutException} cause when the
+   *     archive is not ready by the timeout or the download stalls; an archive over {@link
+   *     #MAX_BATCH_ARCHIVE_SIZE} fails at once
+   * @throws UncheckedIOException if {@code destination} cannot be written
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public long downloadBatchArchive(String batchId, OutputStream destination, Duration timeout)
+      throws InterruptedException {
+    String path = batchPath(batchId) + "/archive";
+    Objects.requireNonNull(destination, "destination");
+    if (timeout == null || timeout.isZero()) timeout = DEFAULT_BATCH_TIMEOUT;
+    if (timeout.isNegative()) throw new IllegalArgumentException("timeout must be positive");
+    long deadline = System.nanoTime() + timeout.toNanos();
+    String requestId = null;
+    Exception lastFailure = null;
+    while (true) {
+      if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+      // No HttpRequest.timeout: it would also cut off the body. The headers must arrive within
+      // the client timeout; the body is then read under an idle timeout.
+      var request =
+          HttpRequest.newBuilder(URI.create(base + "/" + path))
+              .header("X-API-Key", key)
+              .header("User-Agent", USER_AGENT)
+              .GET()
+              .build();
+      HttpResponse<InputStream> response = null;
+      long delay = 1_000_000_000L;
+      var future = http.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+      try {
+        response = future.get(this.timeout.toNanos(), TimeUnit.NANOSECONDS);
+      } catch (TimeoutException e) {
+        future.cancel(true);
+        lastFailure = new HttpTimeoutException("No response within " + this.timeout);
+      } catch (ExecutionException e) {
+        lastFailure = e.getCause() instanceof Exception cause ? cause : e;
+      } catch (InterruptedException e) {
+        future.cancel(true);
+        throw e;
+      }
+      if (response != null) {
+        requestId = response.headers().firstValue("X-Request-ID").orElse(requestId);
+        int status = response.statusCode();
+        try (var body = new IdleStream(response.body(), this.timeout)) {
+          if (status == 200) return copyArchive(body, destination, response, requestId);
+          byte[] detail = readDetail(body);
+          if (status == 202) {
+            lastFailure = null;
+            delay = pollDelayNanos(response);
+          } else if (Set.of(429, 502, 503, 504).contains(status)) {
+            lastFailure =
+                new EtchvException(
+                    status, bounded(detail), requestId, null, null, rateLimitDelay(response));
+            var retryAfter =
+                parseRetryAfter(response.headers().firstValue("Retry-After").orElse(null));
+            if (retryAfter != null) delay = Math.max(10_000_000L, retryAfter.toNanos());
+          } else
+            throw new EtchvException(
+                status, bounded(detail), requestId, null, null, rateLimitDelay(response));
+        } catch (IOException closing) {
+          // Closing a finished body does not affect the outcome.
+        }
+      }
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0) {
+        if (lastFailure instanceof EtchvException e) throw e;
+        throw new EtchvException(
+            0,
+            "Client deadline exceeded; the archive is not ready yet",
+            requestId,
+            null,
+            lastFailure != null ? lastFailure : new TimeoutException("the archive is not ready yet"));
+      }
+      TimeUnit.NANOSECONDS.sleep(Math.min(remaining, delay));
+    }
+  }
+
+  /** Reads a bounded error or 202 body, without failing on a broken stream. */
+  private static byte[] readDetail(IdleStream body) {
+    try {
+      return body.readNBytes(10_000);
+    } catch (IOException e) {
+      return new byte[0];
+    }
+  }
+
+  /** Copies a 200 archive body: checks the zip signature, the size cap and the idle timeout. */
+  private long copyArchive(
+      IdleStream body, OutputStream destination, HttpResponse<?> response, String requestId) {
+    long declared = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+    if (declared > MAX_BATCH_ARCHIVE_SIZE) throw archiveTooLarge(requestId);
+    long total = 0;
+    byte[] buffer = new byte[64 * 1024];
+    boolean first = true;
+    while (true) {
+      int read;
+      try {
+        read = first ? body.readNBytes(buffer, 0, 2) : body.read(buffer);
+        if (body.stalled()) throw new IOException("stalled");
+      } catch (IOException e) {
+        if (body.stalled())
+          throw new EtchvException(
+              0,
+              "Client deadline exceeded; the archive download stalled",
+              requestId,
+              null,
+              new TimeoutException("no archive bytes for " + timeout));
+        throw new EtchvException(
+            0, "Archive download failed: " + e.getMessage(), requestId, null, e);
+      }
+      if (first) {
+        if (read < 2 || buffer[0] != 'P' || buffer[1] != 'K')
+          throw new EtchvException(200, "Invalid archive response", requestId, null);
+        first = false;
+      }
+      if (read < 0) return total;
+      total += read;
+      if (total > MAX_BATCH_ARCHIVE_SIZE) throw archiveTooLarge(requestId);
+      // Time spent in the caller's stream is not idle time of the download.
+      body.pause();
+      try {
+        destination.write(buffer, 0, read);
+      } catch (IOException e) {
+        throw new UncheckedIOException("Cannot write the archive", e);
+      } finally {
+        body.resume();
+      }
+    }
+  }
+
+  /** The client-side size cap, reported like the API's {@code archive_too_large} conflict. */
+  private static EtchvException archiveTooLarge(String requestId) {
+    var detail = new LinkedHashMap<String, Object>();
+    detail.put("code", "archive_too_large");
+    detail.put(
+        "message",
+        "The archive exceeds " + MAX_BATCH_ARCHIVE_SIZE / (1024 * 1024) + " MB; download each item's result_url");
+    return new EtchvException(200, JSON.toJson(Map.of("detail", detail)), requestId, null);
+  }
+
+  private static final ScheduledExecutorService WATCHDOG =
+      Executors.newSingleThreadScheduledExecutor(
+          task -> {
+            var thread = new Thread(task, "etchv-idle-watchdog");
+            thread.setDaemon(true);
+            return thread;
+          });
+
+  /**
+   * A response body that is closed once no bytes arrive for the idle timeout, so a blocked read
+   * ends; {@link #stalled()} then reports why.
+   */
+  private static final class IdleStream extends FilterInputStream {
+    private volatile long last = System.nanoTime();
+    private volatile boolean stalled;
+    private volatile boolean paused;
+    private final ScheduledFuture<?> check;
+
+    IdleStream(InputStream in, Duration idle) {
+      super(in);
+      long limit = idle.toNanos();
+      long period = Math.max(10_000_000L, Math.min(1_000_000_000L, limit / 10));
+      check =
+          WATCHDOG.scheduleWithFixedDelay(
+              () -> {
+                if (!stalled && !paused && System.nanoTime() - last > limit) {
+                  stalled = true;
+                  try {
+                    in.close();
+                  } catch (IOException ignored) {
+                    // The read fails or ends; stalled() reports why.
+                  }
+                }
+              },
+              period,
+              period,
+              TimeUnit.NANOSECONDS);
+    }
+
+    boolean stalled() {
+      return stalled;
+    }
+
+    /** Stops the idle timer, for example while the caller writes what was read. */
+    void pause() {
+      paused = true;
+    }
+
+    /** Restarts the idle timer from now. */
+    void resume() {
+      last = System.nanoTime();
+      paused = false;
+    }
+
+    @Override
+    public int read() throws IOException {
+      int value = super.read();
+      last = System.nanoTime();
+      return value;
+    }
+
+    @Override
+    public int read(byte[] buffer, int offset, int length) throws IOException {
+      int count = super.read(buffer, offset, length);
+      last = System.nanoTime();
+      return count;
+    }
+
+    @Override
+    public void close() throws IOException {
+      check.cancel(false);
+      super.close();
+    }
+  }
+
+  /**
+   * Cancels a batch ({@code POST /watermarks/batches/{id}/cancel}): files not yet running are
+   * refunded and marked {@code cancelled}; files already running finish.
+   *
+   * @param batchId batch ID ({@code bat_…})
+   * @return the batch
+   * @throws EtchvException on API or transport failure
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Batch cancelBatch(String batchId) throws InterruptedException {
+    return parseBatch(
+        call("POST", batchPath(batchId) + "/cancel", null, null, null, true, false, MAX_DOWNLOAD_SIZE));
+  }
+
+  /**
+   * Lists batches, newest first, without their items ({@code GET /watermarks/batches}).
+   *
+   * @param limit page size (1–50), or null for 20
+   * @param before {@code nextCursor} from the previous page, or null for the first page
+   * @return one page of batches
+   * @throws EtchvException on API or transport failure
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public BatchPage listBatches(Integer limit, String before) throws InterruptedException {
+    var query = new StringBuilder("watermarks/batches");
+    char separator = '?';
+    if (limit != null) {
+      if (limit < 1 || limit > 50) throw new IllegalArgumentException("limit must be 1 to 50");
+      query.append(separator).append("limit=").append(limit);
+      separator = '&';
+    }
+    if (before != null) {
+      if (!matches(BATCH_ID, before)) throw new IllegalArgumentException("Invalid batch cursor");
+      query.append(separator).append("before=").append(before);
+    }
+    var response = call("GET", query.toString(), null, null, null, true, false, MAX_DOWNLOAD_SIZE);
+    try {
+      var page = JSON.fromJson(text(response.body()), BatchPage.class);
+      if (page == null || page.items() == null) throw new JsonParseException("empty");
+      return page;
+    } catch (RuntimeException e) {
+      throw new EtchvException(
+          response.statusCode(),
+          "Invalid JSON response",
+          response.headers().firstValue("X-Request-ID").orElse(null),
+          null);
+    }
+  }
+
+  private static String batchPath(String batchId) {
+    if (!matches(BATCH_ID, batchId)) throw new IllegalArgumentException("Invalid batch ID");
+    return "watermarks/batches/" + batchId;
+  }
+
+  private static String batchKey(BatchOptions options) {
+    if (options.webhookId() != null && !matches(WEBHOOK_ID, options.webhookId()))
+      throw new IllegalArgumentException("Invalid webhook ID");
+    if (options.storageDestinationId() != null
+        && !matches(DESTINATION_ID, options.storageDestinationId()))
+      throw new IllegalArgumentException("Invalid storage destination ID");
+    if (options.archive() && options.storageDestinationId() != null)
+      throw new IllegalArgumentException("archive cannot be combined with a storage destination");
+    String key = options.idempotencyKey();
+    if (key == null || key.isEmpty()) return UUID.randomUUID().toString();
+    if (!matches(IDEMPOTENCY_KEY, key))
+      throw new IllegalArgumentException(
+          "Idempotency key must contain 8–128 letters, digits, hyphens or underscores");
+    return key;
+  }
+
+  private static void checkBatchFile(int index, String filename, Map<String, ?> data) {
+    if (filename == null || filename.isEmpty() || filename.length() > 255)
+      throw new IllegalArgumentException("Batch item " + index + " needs a filename of 1–255 characters");
+    if (data == null || data.isEmpty())
+      throw new IllegalArgumentException("Batch item " + index + " needs non-empty data");
+  }
+
+  private static LinkedHashMap<String, Object> batchBody(BatchOptions options) {
+    var body = new LinkedHashMap<String, Object>();
+    body.put("archive", options.archive());
+    if (options.webhookId() != null) body.put("webhook_id", options.webhookId());
+    if (options.accelerator() != null) body.put("accelerator", options.accelerator().value());
+    if (options.storageDestinationId() != null)
+      body.put("storage_destination_id", options.storageDestinationId());
+    return body;
+  }
+
+  private static Batch parseBatch(HttpResponse<byte[]> response) {
+    try {
+      var batch = JSON.fromJson(text(response.body()), Batch.class);
+      if (batch == null || !matches(BATCH_ID, batch.batchId()) || batch.status() == null)
+        throw new JsonParseException("invalid batch");
+      return batch;
+    } catch (RuntimeException e) {
+      throw new EtchvException(
+          response.statusCode(),
+          "Invalid batch response",
+          response.headers().firstValue("X-Request-ID").orElse(null),
+          null);
+    }
+  }
+
+  /** Retry-After of a batch poll (at least 1 s, no upper bound), or 2 s when absent. */
+  private static long pollDelayNanos(HttpResponse<?> response) {
+    var delay = parseRetryAfter(response.headers().firstValue("Retry-After").orElse(null));
+    return delay == null ? 2_000_000_000L : Math.max(1_000_000_000L, delay.toNanos());
+  }
+
+  /** Uploads the pending files of a draft batch with bounded concurrency; stops at the first failure. */
+  private void uploadBatch(
+      String batchId,
+      List<BatchItem> items,
+      long[] sizes,
+      Queue<BatchItemStatus> pending,
+      int concurrency,
+      String idempotency)
+      throws InterruptedException {
+    if (pending.isEmpty()) return;
+    var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+    var failed = new java.util.concurrent.atomic.AtomicReference<BatchItemStatus>();
+    int workers = Math.min(concurrency, pending.size());
+    var pool = Executors.newFixedThreadPool(workers);
+    try {
+      var tasks = new ArrayList<Future<?>>();
+      for (int w = 0; w < workers; w++)
+        tasks.add(
+            pool.submit(
+                () -> {
+                  BatchItemStatus status;
+                  while (failure.get() == null && (status = pending.poll()) != null) {
+                    int index = status.index();
+                    var item = items.get(index);
+                    try {
+                      URI url = signedUrl(status.upload().method(), status.upload().url());
+                      putSigned(
+                          url,
+                          item.file() != null
+                              ? () -> HttpRequest.BodyPublishers.ofByteArray(item.file())
+                              : () -> {
+                                // A file that changed since its size was declared fails at once.
+                                if (java.nio.file.Files.size(item.path()) != sizes[index])
+                                  throw new IllegalStateException(
+                                      item.filename() + " changed size after the batch was created");
+                                return HttpRequest.BodyPublishers.ofFile(item.path());
+                              });
+                    } catch (Throwable e) {
+                      if (failure.compareAndSet(null, e)) failed.set(status);
+                    }
+                  }
+                  return null;
+                }));
+      for (var task : tasks) {
+        try {
+          task.get();
+        } catch (ExecutionException e) {
+          failure.compareAndSet(null, e.getCause());
+        }
+      }
+    } catch (InterruptedException e) {
+      pool.shutdownNow();
+      throw e;
+    } finally {
+      pool.shutdown();
+    }
+    var cause = failure.get();
+    if (cause == null) return;
+    if (cause instanceof InterruptedException interrupted) throw interrupted;
+    var item = failed.get();
+    var etchv = cause instanceof EtchvException e ? e : null;
+    throw new EtchvException(
+        etchv == null ? 0 : etchv.statusCode(),
+        "Upload of item "
+            + (item == null ? "?" : item.index() + " (" + item.filename() + ")")
+            + " failed for batch "
+            + batchId
+            + "; submit again with the same idempotency key to resume: "
+            + (etchv == null ? cause.getMessage() : etchv.detail()),
+        null,
+        idempotency,
+        cause);
+  }
+
+  /**
+   * A batch request within the client deadline. Retries transport failures and HTTP 429, 502 and
+   * 504 (and 503 when {@code retry503}) honoring {@code Retry-After}; with {@code
+   * waitWhileAccepted}, an HTTP 202 is polled again after its {@code Retry-After}. Any other 2xx is
+   * returned.
+   */
+  private HttpResponse<byte[]> call(
+      String method,
+      String path,
+      String contentType,
+      byte[] body,
+      String idempotencyKey,
+      boolean retry503,
+      boolean waitWhileAccepted,
+      long maxBytes)
+      throws InterruptedException {
+    long started = System.nanoTime();
+    String requestId = null;
+    IOException lastFailure = null;
+    while (System.nanoTime() - started < timeout.toNanos()) {
+      if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+      var builder =
+          newRequest(
+              path,
+              Duration.ofNanos(Math.max(1, timeout.toNanos() - (System.nanoTime() - started))));
+      if (idempotencyKey != null) builder.header("Idempotency-Key", idempotencyKey);
+      if (contentType != null) builder.header("Content-Type", contentType);
+      builder.method(
+          method,
+          body == null
+              ? HttpRequest.BodyPublishers.noBody()
+              : HttpRequest.BodyPublishers.ofByteArray(body));
+      HttpResponse<byte[]> response;
+      try {
+        response = http.send(builder.build(), ignored -> new LimitedBody(maxBytes));
+      } catch (IOException e) {
+        if (tooLarge(e)) throw new EtchvException(0, e.getMessage(), requestId, idempotencyKey, e);
+        lastFailure = e;
+        pause(started, 1);
+        continue;
+      }
+      requestId = response.headers().firstValue("X-Request-ID").orElse(requestId);
+      int status = response.statusCode();
+      if (status == 202 && waitWhileAccepted) {
+        long remaining = timeout.toNanos() - (System.nanoTime() - started);
+        if (remaining > 0) TimeUnit.NANOSECONDS.sleep(Math.min(remaining, pollDelayNanos(response)));
+        continue;
+      }
+      if (status >= 200 && status <= 299) return response;
+      if (status == 429 || status == 502 || status == 504 || (status == 503 && retry503)) {
+        pause(
+            started,
+            status == 429
+                ? retryDelaySeconds(response.headers().firstValue("Retry-After").orElse(null))
+                : 1);
+        continue;
+      }
+      throw new EtchvException(
+          status, bounded(response.body()), requestId, idempotencyKey, null, rateLimitDelay(response));
+    }
+    throw new EtchvException(0, "Client deadline exceeded", requestId, idempotencyKey, lastFailure);
   }
 
   // ---------------------------------------------------------------- Internals
@@ -1712,11 +3048,35 @@ public final class EtchvClient implements AutoCloseable {
     return out.toByteArray();
   }
 
+  /** A response over its size cap: final, never retried as a network failure. */
+  private static final class ResponseTooLarge extends IOException {
+    private static final long serialVersionUID = 1L;
+
+    ResponseTooLarge(String message) {
+      super(message);
+    }
+  }
+
+  private static boolean tooLarge(Throwable error) {
+    for (var cause = error; cause != null; cause = cause.getCause())
+      if (cause instanceof ResponseTooLarge) return true;
+    return false;
+  }
+
   // Cancel oversized bodies before buffering the entire response.
   private static final class LimitedBody implements HttpResponse.BodySubscriber<byte[]> {
     private final CompletableFuture<byte[]> result = new CompletableFuture<>();
     private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    private final long limit;
     private Flow.Subscription subscription;
+
+    LimitedBody() {
+      this(MAX_DOWNLOAD_SIZE);
+    }
+
+    LimitedBody(long limit) {
+      this.limit = limit;
+    }
 
     public CompletionStage<byte[]> getBody() {
       return result;
@@ -1729,9 +3089,10 @@ public final class EtchvClient implements AutoCloseable {
 
     public void onNext(List<ByteBuffer> items) {
       for (var item : items) {
-        if ((long) bytes.size() + item.remaining() > MAX_DOWNLOAD_SIZE) {
+        if ((long) bytes.size() + item.remaining() > limit) {
           subscription.cancel();
-          result.completeExceptionally(new IOException("Response exceeds 256 MB"));
+          result.completeExceptionally(
+              new ResponseTooLarge("Response exceeds " + limit / (1024 * 1024) + " MB"));
           return;
         }
         byte[] chunk = new byte[item.remaining()];
@@ -1803,7 +3164,7 @@ public final class EtchvClient implements AutoCloseable {
       try {
         response = http.send(builder.build(), ignored -> new LimitedBody());
       } catch (IOException e) {
-        if (!durable)
+        if (!durable || tooLarge(e))
           throw new EtchvException(0, e.getMessage(), requestId, options.idempotencyKey(), e);
         lastFailure = e;
         pause(started, 1);

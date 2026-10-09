@@ -4,7 +4,7 @@
 
   <groupId>com.etchv</groupId>
   <artifactId>etchv-sdk</artifactId>
-  <version>1.1.0</version>
+  <version>1.2.0</version>
   <packaging>jar</packaging>
 
   <name>Etchv Java SDK</name>
@@ -38,7 +38,7 @@
     <connection>scm:git:https://github.com/etchv-labs/java-sdk.git</connection>
     <developerConnection>scm:git:ssh://git@github.com/etchv-labs/java-sdk.git</developerConnection>
     <url>https://github.com/etchv-labs/java-sdk</url>
-    <tag>v1.0.0</tag>
+    <tag>v1.2.0</tag>
   </scm>
 
   <issueManagement>

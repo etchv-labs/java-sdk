@@ -7,13 +7,13 @@ Server-side Java client for [Etchv](https://etchv.com): embed and detect invisib
 Maven:
 
 ```xml
-<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.1.0</version></dependency>
+<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.2.0</version></dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("com.etchv:etchv-sdk:1.1.0")
+implementation("com.etchv:etchv-sdk:1.2.0")
 ```
 
 Requires Java 21+. `EtchvClient` is thread-safe; create one and close it on shutdown.
@@ -56,6 +56,54 @@ var upload = client.uploadFile("detect", delivered, "delivered.tiff");
 upload.uploadId(); // send as the upload_id form field instead of file
 ```
 
+## Many files at once
+
+Submit up to 100 files in one batch, each with its own data, then wait and collect the results:
+
+```java
+var items = new ArrayList<EtchvClient.BatchItem>();
+try (var files = Files.newDirectoryStream(Path.of("in"), "*.pdf")) {
+    for (var file : files) {
+        String stem = file.getFileName().toString().replaceFirst("\\.pdf$", "");
+        items.add(EtchvClient.BatchItem.of(file, Map.of("recipient", stem)));
+    }
+}
+var batch = client.submitBatch(items, new EtchvClient.BatchOptions().withArchive(true));
+
+// Waits for the batch (here up to 30 minutes), then downloads each result as you iterate.
+try (var results = client.batchResults(batch.batchId(), Duration.ofMinutes(30))) {
+    for (var item : (Iterable<EtchvClient.BatchItemResult>) results::iterator) {
+        if (item.ok()) Files.write(Path.of("out", item.filename()), item.result().bytes());
+        else System.out.println(item.filename() + ": " + item.errorCode()); // credits refunded
+    }
+}
+client.downloadBatchArchive(batch.batchId(), Path.of("out.zip"), Duration.ofMinutes(10));
+```
+
+`submitBatch` creates the batch, uploads every file straight to its own signed upload URL (four at a time by
+default, `withUploadConcurrency`; the API key is never sent there) and starts it. A slow upload keeps going as long
+as bytes flow. The batch's idempotency key is generated unless you set `withIdempotencyKey`, so submitting the same
+files again with the same key is safe and resumes an interrupted upload; a batch that was never started within 24
+hours has expired (HTTP 410, `code()` `batch_expired`) and needs a new key. Files that are rejected or fail are refunded; check each result's
+`errorCode()` (`cancelled` or `expired` for files a canceled or expired batch never ran). Upload URLs last 6 hours
+and a batch must start within 24 hours. Results and the optional archive (`withArchive`, up to 1 GB of results)
+stay available for 24 hours. `waitForBatch(id, timeout)` and `batchResults(id, timeout)` honor the API's
+`Retry-After` between polls, at least 1 s apart (the wait is one hour when the timeout is null).
+
+`downloadBatchArchive` waits while the zip is assembled, then writes it to a `Path` or an `OutputStream` (or returns
+the bytes); it fails only if no bytes arrive for the client timeout. A 409 carries `code()` `batch_not_started`,
+`archive_not_requested`, `archive_too_large` or `archive_unavailable`.
+
+Files that are already together in one zip (up to 55 MB) can go in a single request with `submitBatchZip`, naming
+every member in its manifest:
+
+```java
+var batch = client.submitBatchZip(Path.of("contracts.zip"),
+    List.of(new EtchvClient.BatchZipItem("contracts/acme.pdf", Map.of("recipient", "acme"))), null);
+```
+
+`getBatch`, `cancelBatch` (files not yet running are refunded) and `listBatches` complete the set.
+
 ## GPU processing
 
 Business and Enterprise plans can request GPU processing for any embed, detect or async submission; other plans
@@ -87,6 +135,7 @@ Detection uses `submitDetection`, `getJob(requestId, true)` and `getDetectionRes
 ## Also included
 
 - API key check: `getApiKeyInfo`
+- Batches: `submitBatch`, `submitBatchZip`, `getBatch`, `waitForBatch`, `batchResults`, `downloadBatchArchive`, `cancelBatch`, `listBatches`
 - Assets: `listAssets`, `getAsset`, `updateAsset`, `deleteAsset`, `deleteAssets`, `downloadAsset`
 - Webhooks: `listWebhooks`, `createWebhook`, `updateWebhook`, `deleteWebhook`, `listWebhookDeliveries`, `redeliverWebhook`, and `EtchvClient.verifyWebhookSignature`
 - Customer storage: `listStorageDestinations`, `createStorageDestination`, `updateStorageDestination`, `deleteStorageDestination`, `verifyStorageDestination`, `listStorageDeliveries`, `createStorageDelivery`, `getStorageDelivery`, `retryStorageDelivery`, `downloadStorageDelivery`
