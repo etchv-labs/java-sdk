@@ -53,6 +53,8 @@
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <!-- Reproducible builds. -->
     <project.build.outputTimestamp>2026-09-26T00:00:00Z</project.build.outputTimestamp>
+    <!-- Manual releases stop for a Publish click in the Central Portal; the release workflow sets true. -->
+    <central.autoPublish>false</central.autoPublish>
   </properties>
 
   <dependencies>
@@ -186,7 +188,7 @@
             <extensions>true</extensions>
             <configuration>
               <publishingServerId>central</publishingServerId>
-              <autoPublish>false</autoPublish>
+              <autoPublish>${central.autoPublish}</autoPublish>
             </configuration>
           </plugin>
         </plugins>

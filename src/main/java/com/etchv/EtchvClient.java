@@ -440,7 +440,7 @@ public final class EtchvClient implements AutoCloseable {
    * A verified watermarked file.
    *
    * @param bytes watermarked file in its original format
-   * @param watermarkId 64-character hexadecimal watermark ID
+   * @param watermarkId unique forensic watermark ID for this file, as 64 hexadecimal characters
    * @param requestId Etchv request ID
    * @param contentType MIME type of {@code bytes}
    * @param filename suggested filename

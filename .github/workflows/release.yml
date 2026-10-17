@@ -1,0 +1,38 @@
+name: Release
+# Runs when the monorepo export tags this repository v<version>. Maven Central has
+# no OIDC trusted publishing yet, so the Central Portal token and the signing key
+# are secrets of the protected "release" environment.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          # Keep in sync with maven.compiler.release in pom.xml.
+          java-version: '21'
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: Tag matches the project version
+        run: test "v$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)" = "$GITHUB_REF_NAME"
+      - name: Sign, upload and publish to Maven Central
+        run: mvn -B -Prelease -Dcentral.autoPublish=true deploy
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
