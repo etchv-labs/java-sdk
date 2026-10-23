@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.2.0";
+  public static final String VERSION = "1.3.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -494,15 +494,28 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Detection result for one frame, page or composite.
+   * Detection result for one frame, page, composite or DOCX/PPTX unit.
    *
    * @param index zero-based unit index
    * @param watermarked whether a watermark was found in this unit
    * @param confidence certainty between 0 and 1
    * @param watermarkId decoded watermark ID, or null
+   * @param part DOCX/PPTX only: the package part that carries this unit, otherwise null
    */
   public record DetectionUnit(
-      int index, boolean watermarked, double confidence, String watermarkId) {}
+      int index, boolean watermarked, double confidence, String watermarkId, String part) {
+    /**
+     * Creates a unit without a package part.
+     *
+     * @param index zero-based unit index
+     * @param watermarked whether a watermark was found in this unit
+     * @param confidence certainty between 0 and 1
+     * @param watermarkId decoded watermark ID, or null
+     */
+    public DetectionUnit(int index, boolean watermarked, double confidence, String watermarkId) {
+      this(index, watermarked, confidence, watermarkId, null);
+    }
+  }
 
   /**
    * Detection result for a file.
@@ -1017,9 +1030,9 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Watermarks a PDF and waits for the verified result.
+   * Watermarks a PDF, DOCX or PPTX and waits for the verified result.
    *
-   * @param file PDF bytes (1 byte to 20 MB)
+   * @param file PDF, DOCX or PPTX bytes (1 byte to 20 MB)
    * @param data non-empty forensic JSON object
    * @param options request options, or null
    * @return the watermarked file
@@ -1035,7 +1048,7 @@ public final class EtchvClient implements AutoCloseable {
   /**
    * Watermarks a video and waits for the verified result.
    *
-   * @param file MP4 or MOV bytes (1 byte to 20 MB)
+   * @param file MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 20 MB)
    * @param data non-empty forensic JSON object
    * @param options request options, or null
    * @return the watermarked file
@@ -1062,9 +1075,9 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Detects watermarks in a PDF, page by page. Not retried automatically.
+   * Detects watermarks in a PDF (page by page), DOCX or PPTX. Not retried automatically.
    *
-   * @param file PDF bytes (1 byte to 20 MB)
+   * @param file PDF, DOCX or PPTX bytes (1 byte to 20 MB)
    * @param options request options (storage options are not allowed), or null
    * @return detection result
    * @throws EtchvException on API or transport failure
@@ -1078,7 +1091,7 @@ public final class EtchvClient implements AutoCloseable {
    * Detects watermarks in a video, frame by frame. Uses a durable job: generates an idempotency
    * key, retries transient failures and polls until the client deadline.
    *
-   * @param file MP4 or MOV bytes (1 byte to 20 MB)
+   * @param file MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 20 MB)
    * @param options request options (storage options are not allowed), or null
    * @return detection result
    * @throws EtchvException on API, transport or deadline failure
@@ -3313,7 +3326,17 @@ public final class EtchvClient implements AutoCloseable {
                 || !id.getAsJsonPrimitive().isString()
                 || !matches(WATERMARK_ID, id.getAsString())
             : !id.isJsonNull())) throw new IllegalArgumentException();
-    return new DetectionUnit(index, marked, confidence, marked ? id.getAsString() : null);
+    var part = v.get("part");
+    if (part != null
+        && !part.isJsonNull()
+        && !(part.isJsonPrimitive() && part.getAsJsonPrimitive().isString()))
+      throw new IllegalArgumentException();
+    return new DetectionUnit(
+        index,
+        marked,
+        confidence,
+        marked ? id.getAsString() : null,
+        part == null || part.isJsonNull() ? null : part.getAsString());
   }
 
   private static DetectionResult detection(HttpResponse<byte[]> r) {
@@ -3374,6 +3397,21 @@ public final class EtchvClient implements AutoCloseable {
           s.length() >= 8 && s.substring(4, 8).equals("ftyp")
               ? (mime.equals("video/mp4") ? "mp4" : "mov")
               : null;
+      case "video/webm", "video/x-matroska" ->
+          s.startsWith("\u001a\u0045\u00df\u00a3")
+              ? (mime.equals("video/webm") ? "webm" : "mkv")
+              : null;
+      case "video/mpeg" -> s.startsWith("\0\0\u0001\u00ba") ? "mpg" : null;
+      case "video/mp2t" ->
+          b.length > 376 && b[0] == 0x47 && b[188] == 0x47 && b[376] == 0x47 ? "ts" : null;
+      case "video/x-msvideo" ->
+          s.startsWith("RIFF") && s.length() >= 12 && s.substring(8, 12).equals("AVI ")
+              ? "avi"
+              : null;
+      case "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ->
+          s.startsWith("PK\u0003\u0004") ? "docx" : null;
+      case "application/vnd.openxmlformats-officedocument.presentationml.presentation" ->
+          s.startsWith("PK\u0003\u0004") ? "pptx" : null;
       default -> null;
     };
   }

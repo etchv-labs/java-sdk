@@ -41,6 +41,10 @@ public final class ContractTest {
                 default -> c.detectImage(bytes, options);
               };
           check(d.watermarked() && d.units().size() == 2);
+          check(
+              java.util.Objects.equals(
+                  d.units().get(0).part(),
+                  ext.equals("docx") || ext.equals("pptx") ? "media/image1.png" : null));
         }
       }
       for (String scenario :

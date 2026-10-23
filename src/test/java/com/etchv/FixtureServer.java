@@ -140,6 +140,8 @@ final class FixtureServer implements AutoCloseable {
         u.addProperty("watermarked", true);
         u.addProperty("confidence", .99);
         u.addProperty("watermark_id", id);
+        if (i == 0 && (ext.equals("docx") || ext.equals("pptx")))
+          u.addProperty("part", "media/image1.png");
         units.add(u);
       }
       json.add("units", units);
