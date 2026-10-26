@@ -7,13 +7,13 @@ Server-side Java client for [Etchv](https://etchv.com): embed and detect invisib
 Maven:
 
 ```xml
-<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.3.0</version></dependency>
+<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.4.0</version></dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("com.etchv:etchv-sdk:1.3.0")
+implementation("com.etchv:etchv-sdk:1.4.0")
 ```
 
 Requires Java 21+. `EtchvClient` is thread-safe; create one and close it on shutdown.
@@ -40,9 +40,10 @@ class Example {
 }
 ```
 
-Image uploads are limited to 50 MB; document and video uploads to 20 MB. Detection takes the files Etchv
-delivered: up to 192 MB for images, 64 MB for PDFs and 100 MB for DOCX, PPTX and
-video.
+Image and PDF uploads are limited to 50 MB; DOCX, PPTX and video uploads to 20 MB. A PDF has 1 to 2,000
+pages, and its watermarked copy must fit in 95 MB with 48 KB per page, so a 2,000-page PDF can be up to about
+1 MB. Detection takes the files Etchv delivered: up to 192 MB for images, 95 MB for PDFs and 100 MB for DOCX,
+PPTX and video.
 
 ## Large files
 
@@ -103,7 +104,23 @@ var batch = client.submitBatchZip(Path.of("contracts.zip"),
     List.of(new EtchvClient.BatchZipItem("contracts/acme.pdf", Map.of("recipient", "acme"))), null);
 ```
 
-`getBatch`, `cancelBatch` (files not yet running are refunded) and `listBatches` complete the set.
+`BatchOptions` also takes `withWebhookId`, `withAccelerator`, `withStorageDestinationId` and `withActiveContent`, as
+for single files. `getBatch`, `cancelBatch` (files not yet running are refunded) and `listBatches` complete the set.
+
+## PDF scripts and actions
+
+A watermarked PDF keeps its scripts, actions, form fields and attachments exactly as uploaded. Set
+`ActiveContent.REMOVE_AUTO_RUN` with `Options.withActiveContent` (for `embedDocument` or `submitEmbed("documents",
+…)`) or `BatchOptions.withActiveContent` to also remove what a PDF viewer runs by itself: the open action, document
+and page actions, document-level JavaScript and XFA forms. Links, form fields and attachments stay.
+`REMOVE_AUTO_RUN` is for PDFs only: the API refuses it for a DOCX or PPTX, and for a batch unless every file is a
+PDF. Keeping active content is accepted for any document and any batch.
+[Scripts and actions](https://etchv.com/docs/api/documents#scripts-and-actions).
+
+```java
+var result = client.embedDocument(Files.readAllBytes(Path.of("contract.pdf")), Map.of("recipient", "counsel-7"),
+    new EtchvClient.Options("contract.pdf", null).withActiveContent(EtchvClient.ActiveContent.REMOVE_AUTO_RUN));
+```
 
 ## GPU processing
 

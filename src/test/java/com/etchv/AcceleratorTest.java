@@ -139,6 +139,62 @@ final class AcceleratorTest {
   }
 
   @Test
+  void activeContentIsSentForDocumentEmbeddingOnly() throws Exception {
+    var queries = new CopyOnWriteArrayList<String>();
+    var remove =
+        new EtchvClient.Options("a.pdf", null)
+            .withAccelerator(EtchvClient.Accelerator.GPU)
+            .withActiveContent(EtchvClient.ActiveContent.REMOVE_AUTO_RUN);
+    withServer(
+        e -> {
+          queries.add(e.getRequestURI().getPath() + "?" + e.getRequestURI().getRawQuery());
+          if (e.getRequestURI().getPath().endsWith("/async")) {
+            send(
+                e,
+                202,
+                "application/json",
+                ("{\"status\":\"queued\",\"request_id\":\"" + JOB + "\"}")
+                    .getBytes(StandardCharsets.UTF_8));
+          } else {
+            e.getResponseHeaders().set("X-Watermark-ID", ID);
+            send(e, 200, "application/pdf", "%PDF-1.7".getBytes(StandardCharsets.UTF_8));
+          }
+        },
+        c -> {
+          c.embedDocument(PNG, Map.of("a", 1), remove);
+          c.submitEmbed(
+              "documents",
+              PNG,
+              Map.of("a", 1),
+              new EtchvClient.Options().withActiveContent(EtchvClient.ActiveContent.KEEP),
+              null);
+          for (var call :
+              List.<org.junit.jupiter.api.function.Executable>of(
+                  () -> c.embedImage(PNG, Map.of("a", 1), remove),
+                  () -> c.submitEmbed("videos", PNG, Map.of("a", 1), remove, null),
+                  () -> c.detectDocument(PNG, remove)))
+            assertEquals(
+                "activeContent applies to PDF documents only",
+                assertThrows(IllegalArgumentException.class, call).getMessage());
+          return null;
+        });
+    // Refused before the upload session a large file would start: this client cannot connect.
+    try (var unreachable =
+        new EtchvClient("test-key", "http://127.0.0.1:1", Duration.ofSeconds(1), 1)) {
+      for (var call :
+          List.<org.junit.jupiter.api.function.Executable>of(
+              () -> unreachable.embedImage(PNG, Map.of("a", 1), remove),
+              () -> unreachable.submitEmbed("videos", PNG, Map.of("a", 1), remove, null)))
+        assertThrows(IllegalArgumentException.class, call);
+    }
+    assertEquals(
+        List.of(
+            "/watermarks/documents?accelerator=gpu&active_content=remove_auto_run",
+            "/watermarks/documents/async?active_content=keep"),
+        queries);
+  }
+
+  @Test
   void durableJobsPollResultWithoutRepeatingQueryAndReadJobAccelerator() throws Exception {
     var paths = new CopyOnWriteArrayList<String>();
     var result =

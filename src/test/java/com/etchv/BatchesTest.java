@@ -437,6 +437,42 @@ final class BatchesTest {
   }
 
   @Test
+  void activeContentIsSentWithBatchesAndReported() throws Exception {
+    byte[] zip = {'P', 'K', 5, 6, 0, 0};
+    var bodies = new CopyOnWriteArrayList<String>();
+    serve(
+        (e, path, body) -> {
+          bodies.add(new String(body, StandardCharsets.UTF_8));
+          if (path.equals("/watermarks/batches"))
+            json(e, 201, batch("draft", pendingItem(0, "a.pdf", PDF.length)));
+          else if (path.startsWith("/signed/")) respond(e, 200, null, new byte[0]);
+          else if (e.getRequestMethod().equals("GET")) json(e, 200, batch("starting", ""));
+          else
+            json(
+                e,
+                202,
+                batch("starting", "").replace("\"items\":", "\"active_content\":\"remove_auto_run\",\"items\":"));
+        });
+    var options =
+        new EtchvClient.BatchOptions().withActiveContent(EtchvClient.ActiveContent.REMOVE_AUTO_RUN);
+    try (var client = client()) {
+      var started =
+          client.submitBatch(List.of(EtchvClient.BatchItem.of("a.pdf", PDF, Map.of("n", 1))), options);
+      var zipped =
+          client.submitBatchZip(
+              zip, List.of(new EtchvClient.BatchZipItem("a.pdf", Map.of("n", 1))), options);
+      assertEquals(EtchvClient.ActiveContent.REMOVE_AUTO_RUN, started.activeContent());
+      assertEquals(EtchvClient.ActiveContent.REMOVE_AUTO_RUN, zipped.activeContent());
+      // A batch from an API that does not report the option has none.
+      assertNull(client.getBatch(BATCH).activeContent());
+    }
+    assertEquals(
+        "remove_auto_run",
+        JsonParser.parseString(bodies.get(0)).getAsJsonObject().get("active_content").getAsString());
+    assertTrue(bodies.get(bodies.size() - 2).contains("\"active_content\":\"remove_auto_run\""));
+  }
+
+  @Test
   void archivePollingOutlastsTheClientTimeout() throws Exception {
     byte[] zip = {'P', 'K', 3, 4, 1};
     var gets = new AtomicInteger();

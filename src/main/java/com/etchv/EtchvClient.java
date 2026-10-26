@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.3.0";
+  public static final String VERSION = "1.4.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -52,14 +52,15 @@ public final class EtchvClient implements AutoCloseable {
   public static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(2);
 
   /**
-   * Maximum file size for embedding, in bytes (50 MB). The API rejects PDFs and videos over 20 MB
-   * with status 413.
+   * Maximum file size for embedding, in bytes (50 MB). The API rejects DOCX, PPTX and videos over
+   * 20 MB with status 413. A PDF has 1 to 2,000 pages, and its watermarked copy must fit in 95 MB
+   * with 48 KB per page, so a 2,000-page PDF can be up to about 1 MB.
    */
   public static final int MAX_FILE_SIZE = 50 * 1024 * 1024;
 
   /**
    * Maximum file size for detection, in bytes (192 MB): the largest file Etchv delivers. Each kind
-   * keeps its own delivered limit (images 192 MB, PDFs 64 MB, video 100 MB).
+   * keeps its own delivered limit (images 192 MB, PDFs 95 MB, DOCX, PPTX and video 100 MB).
    */
   public static final int MAX_DETECTION_FILE_SIZE = 192 * 1024 * 1024;
 
@@ -380,6 +381,43 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
+   * What PDF watermarking does with scripts and actions ({@code active_content} query parameter).
+   *
+   * <p>{@link #KEEP}, the API default, returns scripts, actions, form fields and attachments
+   * exactly as uploaded. {@link #REMOVE_AUTO_RUN} also removes what a PDF viewer runs by itself:
+   * the open action, document and page actions, document-level JavaScript and XFA forms. Links,
+   * form fields and attachments stay. PDF only: the API refuses {@link #REMOVE_AUTO_RUN} for DOCX and PPTX (HTTP 422).
+   */
+  public enum ActiveContent {
+    /** Keep scripts and actions as uploaded (the API default). */
+    @SerializedName("keep")
+    KEEP("keep"),
+    /** Remove what a PDF viewer runs by itself. */
+    @SerializedName("remove_auto_run")
+    REMOVE_AUTO_RUN("remove_auto_run");
+
+    private final String value;
+
+    ActiveContent(String value) {
+      this.value = value;
+    }
+
+    /**
+     * Returns the wire value.
+     *
+     * @return {@code keep} or {@code remove_auto_run}
+     */
+    public String value() {
+      return value;
+    }
+
+    @Override
+    public String toString() {
+      return value;
+    }
+  }
+
+  /**
    * Per-request options for media operations.
    *
    * @param filename original filename sent with the upload; a media default is used when null
@@ -390,13 +428,34 @@ public final class EtchvClient implements AutoCloseable {
    * @param storageKey optional relative object key beneath the destination prefix; requires a
    *     destination
    * @param accelerator requested processing hardware; null omits the parameter (CPU)
+   * @param activeContent what a watermarked PDF keeps of its scripts and actions; null omits the
+   *     parameter ({@link ActiveContent#KEEP}). Embedding documents only
    */
   public record Options(
       String filename,
       String idempotencyKey,
       String storageDestinationId,
       String storageKey,
-      Accelerator accelerator) {
+      Accelerator accelerator,
+      ActiveContent activeContent) {
+    /**
+     * Options without an active-content choice.
+     *
+     * @param filename original filename, or null
+     * @param idempotencyKey idempotency key, or null
+     * @param storageDestinationId storage destination ID, or null
+     * @param storageKey storage object key, or null
+     * @param accelerator requested processing hardware, or null
+     */
+    public Options(
+        String filename,
+        String idempotencyKey,
+        String storageDestinationId,
+        String storageKey,
+        Accelerator accelerator) {
+      this(filename, idempotencyKey, storageDestinationId, storageKey, accelerator, null);
+    }
+
     /**
      * Options without an accelerator.
      *
@@ -417,7 +476,20 @@ public final class EtchvClient implements AutoCloseable {
      * @return new options
      */
     public Options withAccelerator(Accelerator accelerator) {
-      return new Options(filename, idempotencyKey, storageDestinationId, storageKey, accelerator);
+      return new Options(
+          filename, idempotencyKey, storageDestinationId, storageKey, accelerator, activeContent);
+    }
+
+    /**
+     * Returns a copy of these options with the given active-content choice (PDF embedding only).
+     *
+     * @param activeContent {@link ActiveContent#REMOVE_AUTO_RUN} to remove what a PDF viewer runs
+     *     by itself, or null for the default ({@link ActiveContent#KEEP})
+     * @return new options
+     */
+    public Options withActiveContent(ActiveContent activeContent) {
+      return new Options(
+          filename, idempotencyKey, storageDestinationId, storageKey, accelerator, activeContent);
     }
 
     /**
@@ -1032,7 +1104,11 @@ public final class EtchvClient implements AutoCloseable {
   /**
    * Watermarks a PDF, DOCX or PPTX and waits for the verified result.
    *
-   * @param file PDF, DOCX or PPTX bytes (1 byte to 20 MB)
+   * <p>A PDF has 1 to 2,000 pages and up to 50 MB; its watermarked copy must fit in 95 MB with 48
+   * KB per page, so a 2,000-page PDF can be up to about 1 MB. Set {@link Options#activeContent()}
+   * to {@link ActiveContent#REMOVE_AUTO_RUN} to remove what a PDF viewer runs by itself.
+   *
+   * @param file PDF (up to 50 MB), DOCX or PPTX (up to 20 MB) bytes
    * @param data non-empty forensic JSON object
    * @param options request options, or null
    * @return the watermarked file
@@ -1064,7 +1140,7 @@ public final class EtchvClient implements AutoCloseable {
   /**
    * Detects a watermark in an image. Synchronous image detection is not retried automatically.
    *
-   * @param file encoded image bytes (1 byte to 50 MB)
+   * @param file delivered image bytes (1 byte to 192 MB; above 95 MB as a job)
    * @param options request options (storage options are not allowed), or null
    * @return detection result
    * @throws EtchvException on API or transport failure
@@ -1077,7 +1153,7 @@ public final class EtchvClient implements AutoCloseable {
   /**
    * Detects watermarks in a PDF (page by page), DOCX or PPTX. Not retried automatically.
    *
-   * @param file PDF, DOCX or PPTX bytes (1 byte to 20 MB)
+   * @param file delivered PDF (up to 95 MB), DOCX or PPTX (up to 100 MB) bytes
    * @param options request options (storage options are not allowed), or null
    * @return detection result
    * @throws EtchvException on API or transport failure
@@ -1091,7 +1167,7 @@ public final class EtchvClient implements AutoCloseable {
    * Detects watermarks in a video, frame by frame. Uses a durable job: generates an idempotency
    * key, retries transient failures and polls until the client deadline.
    *
-   * @param file MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 20 MB)
+   * @param file delivered MP4, MOV, WebM, Matroska, MPEG or AVI bytes (1 byte to 100 MB)
    * @param options request options (storage options are not allowed), or null
    * @return detection result
    * @throws EtchvException on API, transport or deadline failure
@@ -1108,10 +1184,11 @@ public final class EtchvClient implements AutoCloseable {
    * its job receipt without waiting for processing.
    *
    * @param media {@code images}, {@code documents} or {@code videos}
-   * @param file file bytes (1 byte to 50 MB; PDFs and videos up to 20 MB)
+   * @param file file bytes (1 byte to 50 MB; DOCX, PPTX and videos up to 20 MB)
    * @param data non-empty forensic JSON object
    * @param options request options, or null; an idempotency key is generated when absent, but
-   *     persist your own to recover a lost receipt
+   *     persist your own to recover a lost receipt. {@link Options#activeContent()} applies to
+   *     {@code documents} only
    * @param webhookId optional webhook endpoint ID ({@code wh_…}), or null
    * @return JSON job receipt with {@code request_id}, {@code status}, {@code status_url} and
    *     {@code result_url}
@@ -1130,7 +1207,8 @@ public final class EtchvClient implements AutoCloseable {
    * Submits a background detection job ({@code POST /watermarks/{media}/detect/async}).
    *
    * @param media {@code images}, {@code documents} or {@code videos}
-   * @param file file bytes (1 byte to 50 MB; PDFs and videos up to 20 MB)
+   * @param file delivered file bytes (images up to 192 MB, PDFs up to 95 MB, DOCX, PPTX and videos
+   *     up to 100 MB)
    * @param options request options (storage options are not allowed), or null
    * @param webhookId optional webhook endpoint ID ({@code wh_…}), or null
    * @return JSON job receipt
@@ -1686,6 +1764,8 @@ public final class EtchvClient implements AutoCloseable {
    *     underscores); generated when null
    * @param uploadConcurrency files uploaded at once (at least 1; ignored by {@link
    *     #submitBatchZip})
+   * @param activeContent what every file keeps of its scripts and actions, or null ({@link
+   *     ActiveContent#KEEP}); {@link ActiveContent#REMOVE_AUTO_RUN} needs every file to be a PDF
    */
   public record BatchOptions(
       boolean archive,
@@ -1693,10 +1773,38 @@ public final class EtchvClient implements AutoCloseable {
       Accelerator accelerator,
       String storageDestinationId,
       String idempotencyKey,
-      int uploadConcurrency) {
+      int uploadConcurrency,
+      ActiveContent activeContent) {
     /** Default options: no archive, no webhook, CPU, four uploads at once. */
     public BatchOptions() {
       this(false, null, null, null, null, DEFAULT_UPLOAD_CONCURRENCY);
+    }
+
+    /**
+     * Options without an active-content choice.
+     *
+     * @param archive whether to build the archive
+     * @param webhookId endpoint ID, or null
+     * @param accelerator requested processing hardware, or null
+     * @param storageDestinationId destination ID, or null
+     * @param idempotencyKey idempotency key, or null
+     * @param uploadConcurrency files uploaded at once (at least 1)
+     */
+    public BatchOptions(
+        boolean archive,
+        String webhookId,
+        Accelerator accelerator,
+        String storageDestinationId,
+        String idempotencyKey,
+        int uploadConcurrency) {
+      this(
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          null);
     }
 
     /**
@@ -1707,7 +1815,13 @@ public final class EtchvClient implements AutoCloseable {
      */
     public BatchOptions withArchive(boolean archive) {
       return new BatchOptions(
-          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
     }
 
     /**
@@ -1718,7 +1832,13 @@ public final class EtchvClient implements AutoCloseable {
      */
     public BatchOptions withWebhookId(String webhookId) {
       return new BatchOptions(
-          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
     }
 
     /**
@@ -1729,7 +1849,13 @@ public final class EtchvClient implements AutoCloseable {
      */
     public BatchOptions withAccelerator(Accelerator accelerator) {
       return new BatchOptions(
-          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
     }
 
     /**
@@ -1740,7 +1866,13 @@ public final class EtchvClient implements AutoCloseable {
      */
     public BatchOptions withStorageDestinationId(String storageDestinationId) {
       return new BatchOptions(
-          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
     }
 
     /**
@@ -1751,7 +1883,13 @@ public final class EtchvClient implements AutoCloseable {
      */
     public BatchOptions withIdempotencyKey(String idempotencyKey) {
       return new BatchOptions(
-          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
     }
 
     /**
@@ -1762,7 +1900,31 @@ public final class EtchvClient implements AutoCloseable {
      */
     public BatchOptions withUploadConcurrency(int uploadConcurrency) {
       return new BatchOptions(
-          archive, webhookId, accelerator, storageDestinationId, idempotencyKey, uploadConcurrency);
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
+    }
+
+    /**
+     * Returns a copy with an active-content choice for every file.
+     *
+     * @param activeContent {@link ActiveContent#REMOVE_AUTO_RUN} (every file must be a PDF), or
+     *     null for the default ({@link ActiveContent#KEEP})
+     * @return new options
+     */
+    public BatchOptions withActiveContent(ActiveContent activeContent) {
+      return new BatchOptions(
+          archive,
+          webhookId,
+          accelerator,
+          storageDestinationId,
+          idempotencyKey,
+          uploadConcurrency,
+          activeContent);
     }
   }
 
@@ -1865,6 +2027,8 @@ public final class EtchvClient implements AutoCloseable {
    * @param archiveUrl archive path with {@code archive}, or null
    * @param archiveExpiresAt when the archive expires, or null
    * @param items every file in index order; empty in {@link #listBatches} pages
+   * @param activeContent what the batch's PDFs keep of their scripts and actions, or null when
+   *     not reported
    */
   public record Batch(
       String batchId,
@@ -1885,10 +2049,77 @@ public final class EtchvClient implements AutoCloseable {
       String archiveStatus,
       String archiveUrl,
       String archiveExpiresAt,
-      List<BatchItemStatus> items) {
+      List<BatchItemStatus> items,
+      ActiveContent activeContent) {
     /** Normalizes a missing item list to an empty one. */
     public Batch {
       items = items == null ? List.of() : List.copyOf(items);
+    }
+
+    /**
+     * A batch without an active-content choice, as reported before 1.4.0.
+     *
+     * @param batchId batch ID
+     * @param status batch status
+     * @param itemCount number of files
+     * @param archive whether a zip of every result is built
+     * @param accelerator requested processing hardware
+     * @param webhookId webhook endpoint, or null
+     * @param storageDestinationId storage destination, or null
+     * @param counts item counts
+     * @param credits reserved, charged and refunded credits
+     * @param cancelRequested whether the batch was canceled
+     * @param createdAt creation time
+     * @param startedAt start time, or null
+     * @param completedAt end time, or null
+     * @param uploadExpiresAt when a draft expires
+     * @param statusUrl path of this batch
+     * @param archiveStatus archive state, or null
+     * @param archiveUrl archive path, or null
+     * @param archiveExpiresAt when the archive expires, or null
+     * @param items every file in index order
+     */
+    public Batch(
+        String batchId,
+        String status,
+        int itemCount,
+        boolean archive,
+        Accelerator accelerator,
+        String webhookId,
+        String storageDestinationId,
+        BatchCounts counts,
+        BatchCredits credits,
+        boolean cancelRequested,
+        String createdAt,
+        String startedAt,
+        String completedAt,
+        String uploadExpiresAt,
+        String statusUrl,
+        String archiveStatus,
+        String archiveUrl,
+        String archiveExpiresAt,
+        List<BatchItemStatus> items) {
+      this(
+          batchId,
+          status,
+          itemCount,
+          archive,
+          accelerator,
+          webhookId,
+          storageDestinationId,
+          counts,
+          credits,
+          cancelRequested,
+          createdAt,
+          startedAt,
+          completedAt,
+          uploadExpiresAt,
+          statusUrl,
+          archiveStatus,
+          archiveUrl,
+          archiveExpiresAt,
+          items,
+          null);
     }
 
     /**
@@ -2657,6 +2888,7 @@ public final class EtchvClient implements AutoCloseable {
     if (options.accelerator() != null) body.put("accelerator", options.accelerator().value());
     if (options.storageDestinationId() != null)
       body.put("storage_destination_id", options.storageDestinationId());
+    if (options.activeContent() != null) body.put("active_content", options.activeContent().value());
     return body;
   }
 
@@ -2928,6 +3160,7 @@ public final class EtchvClient implements AutoCloseable {
     if (webhookId != null && !matches(WEBHOOK_ID, webhookId))
       throw new IllegalArgumentException("Invalid webhook ID");
     if (options == null) options = new Options();
+    checkActiveContent(media, data, options);
     String idempotency = options.idempotencyKey();
     if (idempotency == null || idempotency.isEmpty()) idempotency = UUID.randomUUID().toString();
     String filename = options.filename() == null ? defaultFilename(media) : options.filename();
@@ -2946,7 +3179,8 @@ public final class EtchvClient implements AutoCloseable {
                 idempotency,
                 options.storageDestinationId(),
                 options.storageKey(),
-                options.accelerator()),
+                options.accelerator(),
+                options.activeContent()),
             true,
             data == null);
     return parseObject(r.body());
@@ -2980,6 +3214,12 @@ public final class EtchvClient implements AutoCloseable {
     return detection(post(media, file, null, options));
   }
 
+  /** Refuses activeContent outside document embedding, before any upload session is created. */
+  private static void checkActiveContent(String media, String data, Options options) {
+    if (options.activeContent() != null && (data == null || !media.equals("documents")))
+      throw new IllegalArgumentException("activeContent applies to PDF documents only");
+  }
+
   /**
    * The upload session to send instead of the file, or null when the file fits in the request.
    * Uploaded once per call, so every retry of the request reuses it.
@@ -3005,6 +3245,7 @@ public final class EtchvClient implements AutoCloseable {
       throw new IllegalArgumentException(
           "file must contain 1 byte to " + limit / (1024 * 1024) + " MB");
     if (options == null) options = new Options();
+    checkActiveContent(media, data, options);
     boolean durable = data != null || media.equals("videos");
     String filename = options.filename() != null ? options.filename() : defaultFilename(media);
     String idempotency = options.idempotencyKey();
@@ -3020,7 +3261,8 @@ public final class EtchvClient implements AutoCloseable {
             idempotency,
             options.storageDestinationId(),
             options.storageKey(),
-            options.accelerator()),
+            options.accelerator(),
+            options.activeContent()),
         durable,
         data == null && media.equals("videos"));
   }
@@ -3154,6 +3396,8 @@ public final class EtchvClient implements AutoCloseable {
     }
     if (options.accelerator() != null)
       path += (path.contains("?") ? "&" : "?") + "accelerator=" + options.accelerator().value();
+    if (options.activeContent() != null)
+      path += (path.contains("?") ? "&" : "?") + "active_content=" + options.activeContent().value();
     long started = System.nanoTime();
     String requestId = null;
     String boundary = "etchv-" + UUID.randomUUID();
