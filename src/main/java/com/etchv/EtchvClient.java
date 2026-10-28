@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.4.0";
+  public static final String VERSION = "1.5.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -598,6 +598,10 @@ public final class EtchvClient implements AutoCloseable {
    * @param requestId Etchv request ID
    * @param units per-unit results
    * @param accelerator hardware that actually processed the request, or null when not reported
+   * @param copy the traceable link copy the watermark is on, or null when it is not one or the
+   *     key lacks {@code links:read}
+   * @param asset another of your watermarked assets the watermark is on, or null when there is
+   *     none or the key lacks {@code assets:read}
    */
   public record DetectionResult(
       boolean watermarked,
@@ -605,7 +609,29 @@ public final class EtchvClient implements AutoCloseable {
       String watermarkId,
       String requestId,
       List<DetectionUnit> units,
-      Accelerator accelerator) {
+      Accelerator accelerator,
+      DetectedCopy copy,
+      DetectedAsset asset) {
+    /**
+     * Creates a result without a link copy or asset.
+     *
+     * @param watermarked whether every unit carries the same watermark
+     * @param confidence lowest per-unit confidence
+     * @param watermarkId decoded watermark ID, or null
+     * @param requestId request ID
+     * @param units per-unit results
+     * @param accelerator processing hardware, or null
+     */
+    public DetectionResult(
+        boolean watermarked,
+        double confidence,
+        String watermarkId,
+        String requestId,
+        List<DetectionUnit> units,
+        Accelerator accelerator) {
+      this(watermarked, confidence, watermarkId, requestId, units, accelerator, null, null);
+    }
+
     /**
      * Creates a result without accelerator information.
      *
@@ -624,6 +650,34 @@ public final class EtchvClient implements AutoCloseable {
       this(watermarked, confidence, watermarkId, requestId, units, null);
     }
   }
+
+  /**
+   * The traceable link copy a detected watermark is on.
+   *
+   * @param assetId the copy's asset ID ({@code ast_…})
+   * @param link the link the copy was made for
+   * @param recipient the recipient's email
+   * @param openedAt when the recipient first opened the link (ISO 8601), or null
+   */
+  public record DetectedCopy(String assetId, DetectedLink link, String recipient, String openedAt) {}
+
+  /**
+   * The link named by a {@link DetectedCopy}.
+   *
+   * @param id link ID ({@code lnk_…})
+   * @param name link name
+   */
+  public record DetectedLink(String id, String name) {}
+
+  /**
+   * Another of your watermarked assets a detected watermark is on.
+   *
+   * @param assetId asset ID ({@code ast_…})
+   * @param name display name
+   * @param metadata the asset's metadata, or null
+   * @param createdAt creation time (ISO 8601)
+   */
+  public record DetectedAsset(String assetId, String name, JsonObject metadata, String createdAt) {}
 
   /**
    * An asset library record.
@@ -771,6 +825,8 @@ public final class EtchvClient implements AutoCloseable {
   private static final Pattern DESTINATION_ID = Pattern.compile("dst_[a-f0-9]{32}");
   private static final Pattern DELIVERY_ID = Pattern.compile("std_[a-f0-9]{64}");
   private static final Pattern BATCH_ID = Pattern.compile("bat_[a-f0-9]{32}");
+  private static final Pattern LINK_ID = Pattern.compile("lnk_[a-f0-9]{32}");
+  private static final Pattern LINK_EVENT_ID = Pattern.compile("lev_[a-f0-9]{32}");
   private static final Pattern IDEMPOTENCY_KEY = Pattern.compile("[A-Za-z0-9_-]{8,128}");
   private static final Set<String> MEDIA = Set.of("images", "documents", "videos");
   private static final Set<String> ASSET_FILTERS =
@@ -3050,6 +3106,450 @@ public final class EtchvClient implements AutoCloseable {
     throw new EtchvException(0, "Client deadline exceeded", requestId, idempotencyKey, lastFailure);
   }
 
+  // ---------------------------------------------------------------- Traceable links
+
+  /**
+   * When a link's copies are made ({@code prepare}).
+   *
+   * <p>{@link #ON_CREATE} is the API default for video and PDFs over 5 pages, {@link #ON_OPEN}
+   * for images, shorter PDFs and other documents. Links for allowed domains always use {@link
+   * #ON_OPEN}.
+   */
+  public enum LinkPrepare {
+    /** Each copy is made when its recipient first opens the link. */
+    @SerializedName("on_open")
+    ON_OPEN("on_open"),
+    /** Every listed recipient's copy is made when the link is created. */
+    @SerializedName("on_create")
+    ON_CREATE("on_create");
+
+    private final String value;
+
+    LinkPrepare(String value) {
+      this.value = value;
+    }
+
+    /**
+     * Returns the wire value.
+     *
+     * @return {@code on_open} or {@code on_create}
+     */
+    public String value() {
+      return value;
+    }
+
+    @Override
+    public String toString() {
+      return value;
+    }
+  }
+
+  /**
+   * Who may open a link and how, for {@link #createLink} and {@link #estimateLink}. Start from
+   * {@link #recipients(List)} or {@link #allowedDomains(List)} and use the {@code with…} methods.
+   *
+   * @param recipients recipients' emails (up to 100); give this or {@code allowedDomains}
+   * @param allowedDomains email domains whose addresses may open the link, exact match (up to 10)
+   * @param expiresAt expiry, or null for 30 days from now (or the source file's expiry if sooner);
+   *     at least five minutes away and at most a year
+   * @param prepare when copies are made, or null to let the API choose
+   * @param downloadLimit downloads allowed per recipient (1–100), or null for unlimited
+   * @param webhookId webhook endpoint ({@code wh_…}) that receives {@code link.opened} and {@code
+   *     link.locked} events, or null
+   * @param idempotencyKey key that makes {@link #createLink} safely repeatable (8–128 letters,
+   *     digits, hyphens or underscores); generated when null
+   */
+  public record LinkOptions(
+      List<String> recipients,
+      List<String> allowedDomains,
+      Instant expiresAt,
+      LinkPrepare prepare,
+      Integer downloadLimit,
+      String webhookId,
+      String idempotencyKey) {
+    /**
+     * A link for these recipients.
+     *
+     * @param recipients recipients' emails
+     * @return options
+     */
+    public static LinkOptions recipients(List<String> recipients) {
+      return new LinkOptions(recipients, null, null, null, null, null, null);
+    }
+
+    /**
+     * A link anyone with a verified email at one of these domains may open.
+     *
+     * @param allowedDomains email domains, for example {@code example.com}
+     * @return options
+     */
+    public static LinkOptions allowedDomains(List<String> allowedDomains) {
+      return new LinkOptions(null, allowedDomains, null, null, null, null, null);
+    }
+
+    /**
+     * Returns a copy with an expiry.
+     *
+     * @param expiresAt expiry, or null for the default
+     * @return updated options
+     */
+    public LinkOptions withExpiresAt(Instant expiresAt) {
+      return new LinkOptions(
+          recipients, allowedDomains, expiresAt, prepare, downloadLimit, webhookId, idempotencyKey);
+    }
+
+    /**
+     * Returns a copy with a preparation choice.
+     *
+     * @param prepare when copies are made, or null to let the API choose
+     * @return updated options
+     */
+    public LinkOptions withPrepare(LinkPrepare prepare) {
+      return new LinkOptions(
+          recipients, allowedDomains, expiresAt, prepare, downloadLimit, webhookId, idempotencyKey);
+    }
+
+    /**
+     * Returns a copy with a per-recipient download limit.
+     *
+     * @param downloadLimit 1–100, or null for unlimited
+     * @return updated options
+     */
+    public LinkOptions withDownloadLimit(Integer downloadLimit) {
+      return new LinkOptions(
+          recipients, allowedDomains, expiresAt, prepare, downloadLimit, webhookId, idempotencyKey);
+    }
+
+    /**
+     * Returns a copy with a webhook endpoint.
+     *
+     * @param webhookId endpoint ID ({@code wh_…}), or null
+     * @return updated options
+     */
+    public LinkOptions withWebhookId(String webhookId) {
+      return new LinkOptions(
+          recipients, allowedDomains, expiresAt, prepare, downloadLimit, webhookId, idempotencyKey);
+    }
+
+    /**
+     * Returns a copy with an idempotency key.
+     *
+     * @param idempotencyKey 8–128 letters, digits, hyphens or underscores, or null to generate
+     * @return updated options
+     */
+    public LinkOptions withIdempotencyKey(String idempotencyKey) {
+      return new LinkOptions(
+          recipients, allowedDomains, expiresAt, prepare, downloadLimit, webhookId, idempotencyKey);
+    }
+  }
+
+  /**
+   * A recipient's watermarked copy.
+   *
+   * @param status {@code not_started}, {@code preparing}, {@code ready} or {@code failed}
+   * @param assetId the copy in the asset library once ready, or null
+   * @param errorCode why the copy failed, or null
+   */
+  public record LinkCopy(String status, String assetId, String errorCode) {}
+
+  /**
+   * One recipient of a link, with their opens and downloads.
+   *
+   * @param email recipient's email
+   * @param status {@code not_opened} or {@code opened}
+   * @param openedAt first open (ISO 8601), after the recipient confirmed their email, or null
+   * @param lastOpenedAt latest open (ISO 8601), or null
+   * @param openCount opens
+   * @param downloadCount downloads
+   * @param copy the recipient's copy
+   */
+  public record LinkRecipient(
+      String email,
+      String status,
+      String openedAt,
+      String lastOpenedAt,
+      int openCount,
+      int downloadCount,
+      LinkCopy copy) {}
+
+  /**
+   * A traceable link.
+   *
+   * @param id link ID ({@code lnk_…})
+   * @param url what you send to your recipients
+   * @param name shown to recipients
+   * @param assetId source asset ({@code ast_…})
+   * @param mediaType {@code image}, {@code document} or {@code video}
+   * @param status {@code active}, {@code revoked}, {@code expired} or {@code unavailable} (the
+   *     source file was deleted or expired, so no new copies are made)
+   * @param prepare {@code on_open} or {@code on_create}
+   * @param allowedDomains email domains that may open the link; empty for a recipient list
+   * @param expiresAt expiry (ISO 8601)
+   * @param downloadLimit downloads allowed per recipient, or null for unlimited
+   * @param recipientCount recipients
+   * @param creditsPerCopy credits each copy takes
+   * @param estimatedCredits every listed recipient's copy, or null for allowed domains
+   * @param batchId the batch making the copies with {@code on_create}, or null
+   * @param webhookId webhook endpoint, or null
+   * @param createdAt creation time (ISO 8601)
+   * @param revokedAt revocation time (ISO 8601), or null
+   * @param recipients each recipient and their copy; empty in {@link #listLinks} pages. For
+   *     allowed domains, those who have opened the link.
+   */
+  public record Link(
+      String id,
+      String url,
+      String name,
+      String assetId,
+      String mediaType,
+      String status,
+      String prepare,
+      List<String> allowedDomains,
+      String expiresAt,
+      Integer downloadLimit,
+      int recipientCount,
+      int creditsPerCopy,
+      Integer estimatedCredits,
+      String batchId,
+      String webhookId,
+      String createdAt,
+      String revokedAt,
+      List<LinkRecipient> recipients) {
+    /** Normalizes missing lists to empty ones. */
+    public Link {
+      allowedDomains = allowedDomains == null ? List.of() : List.copyOf(allowedDomains);
+      recipients = recipients == null ? List.of() : List.copyOf(recipients);
+    }
+  }
+
+  /**
+   * A page of links, newest first.
+   *
+   * @param items links, without recipients
+   * @param nextCursor pass as {@code before} for the next page, or null at the end
+   */
+  public record LinkPage(@SerializedName("data") List<Link> items, String nextCursor) {}
+
+  /**
+   * What a link's copies would cost, from {@link #estimateLink}.
+   *
+   * @param assetId source asset
+   * @param mediaType {@code image}, {@code document} or {@code video}
+   * @param prepare when copies would be made
+   * @param creditsPerCopy credits each copy takes
+   * @param estimatedCredits every listed recipient's copy, or null for allowed domains
+   * @param availableCredits credits the workspace has
+   * @param enoughCredits whether creating the link now would pass the credit check
+   * @param latestExpiresAt the latest expiry the link could have (ISO 8601)
+   */
+  public record LinkEstimate(
+      String assetId,
+      String mediaType,
+      String prepare,
+      int creditsPerCopy,
+      Integer estimatedCredits,
+      int availableCredits,
+      boolean enoughCredits,
+      String latestExpiresAt) {}
+
+  /**
+   * An open, download or lock of a link.
+   *
+   * @param id event ID ({@code lev_…})
+   * @param type {@code opened}, {@code downloaded} or {@code locked} (too many wrong codes; the
+   *     link takes no codes until the next UTC day)
+   * @param recipient recipient's email, or null for {@code locked}
+   * @param createdAt when it happened (ISO 8601)
+   * @param verifiedBy for an open, how the recipient proved their email, or null
+   * @param assetId for a download, the copy downloaded, or null
+   */
+  public record LinkEvent(
+      String id,
+      String type,
+      String recipient,
+      String createdAt,
+      String verifiedBy,
+      String assetId) {}
+
+  /**
+   * A page of a link's events, newest first.
+   *
+   * @param items events
+   * @param nextCursor pass as {@code before} for the next page, or null at the end
+   */
+  public record LinkEventPage(@SerializedName("data") List<LinkEvent> items, String nextCursor) {}
+
+  /**
+   * Shares a source asset so each recipient downloads their own watermarked copy ({@code POST
+   * /links}, {@code links:write}). Send the returned {@link Link#url()} to your recipients
+   * yourself.
+   *
+   * <p>Retries transient failures (HTTP 429, 502, 503, 504 and transport errors) with one
+   * idempotency key, generated when {@code options} has none, so a retry returns the same link.
+   *
+   * @param assetId source asset ({@code ast_…}), for example a result's {@code sourceAssetId}
+   * @param name shown to recipients, 1–200 characters
+   * @param options recipients or allowed domains, and optional settings
+   * @return the link with each recipient
+   * @throws IllegalArgumentException for invalid input, before any request
+   * @throws EtchvException 402 with {@code code()} {@code insufficient_credits} when the workspace
+   *     lacks the credits for the copies; 409 when the key was used for a different link; 410 when
+   *     the source file expired
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Link createLink(String assetId, String name, LinkOptions options)
+      throws InterruptedException {
+    var body = linkBody(assetId, name, options);
+    String key = options.idempotencyKey();
+    if (key == null || key.isEmpty()) key = UUID.randomUUID().toString();
+    else if (!matches(IDEMPOTENCY_KEY, key))
+      throw new IllegalArgumentException(
+          "Idempotency key must contain 8–128 letters, digits, hyphens or underscores");
+    var response =
+        call(
+            "POST",
+            "links",
+            "application/json",
+            JSON.toJson(body).getBytes(StandardCharsets.UTF_8),
+            key,
+            true,
+            false,
+            MAX_DOWNLOAD_SIZE);
+    return parse(response, Link.class);
+  }
+
+  /**
+   * Runs every check of {@link #createLink} without creating anything, and reports the credits
+   * its copies would take ({@code POST /links/estimate}, {@code links:write}). Not retried; the
+   * idempotency key in {@code options} is ignored.
+   *
+   * @param assetId source asset ({@code ast_…})
+   * @param name 1–200 characters
+   * @param options recipients or allowed domains, and optional settings
+   * @return the estimate
+   * @throws IllegalArgumentException for invalid input, before any request
+   * @throws EtchvException on API or transport failure
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public LinkEstimate estimateLink(String assetId, String name, LinkOptions options)
+      throws InterruptedException {
+    return json("links/estimate", "POST", linkBody(assetId, name, options), LinkEstimate.class);
+  }
+
+  /**
+   * Lists links newest first, without recipients ({@code GET /links}, {@code links:read}).
+   *
+   * @param limit page size (1–50), or null for 20
+   * @param before {@code nextCursor} from the previous page, or null for the first page
+   * @return one page of links
+   * @throws EtchvException on API or transport failure
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public LinkPage listLinks(Integer limit, String before) throws InterruptedException {
+    return json(
+        "links" + pageQuery(limit, 50, before, LINK_ID, "link cursor"), "GET", null, LinkPage.class);
+  }
+
+  /**
+   * Reads a link with each recipient, their opens and downloads, and their copy ({@code GET
+   * /links/{id}}, {@code links:read}).
+   *
+   * @param id link ID ({@code lnk_…})
+   * @return the link
+   * @throws EtchvException 404 for an unknown link
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Link getLink(String id) throws InterruptedException {
+    return json(linkPath(id), "GET", null, Link.class);
+  }
+
+  /**
+   * Lists a link's opens, downloads and locks newest first ({@code GET /links/{id}/events},
+   * {@code links:read}).
+   *
+   * @param id link ID ({@code lnk_…})
+   * @param limit page size (1–100), or null for 50
+   * @param before {@code nextCursor} from the previous page, or null for the first page
+   * @return one page of events
+   * @throws EtchvException 404 for an unknown link
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public LinkEventPage listLinkEvents(String id, Integer limit, String before)
+      throws InterruptedException {
+    String path = linkPath(id) + "/events";
+    return json(
+        path + pageQuery(limit, 100, before, LINK_EVENT_ID, "link event cursor"),
+        "GET",
+        null,
+        LinkEventPage.class);
+  }
+
+  /**
+   * Stops new opens and downloads at once ({@code POST /links/{id}/revoke}, {@code links:write}).
+   * Copies not yet queued are canceled and refunded; downloaded copies keep their watermark.
+   * Calling again returns the link.
+   *
+   * @param id link ID ({@code lnk_…})
+   * @return the revoked link
+   * @throws EtchvException 404 for an unknown link
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Link revokeLink(String id) throws InterruptedException {
+    return json(linkPath(id) + "/revoke", "POST", null, Link.class);
+  }
+
+  private static String linkPath(String id) {
+    if (!matches(LINK_ID, id)) throw new IllegalArgumentException("Invalid link ID");
+    return "links/" + id;
+  }
+
+  /** {@code ?limit=…&before=…} for a cursor-paged listing; empty when neither is given. */
+  private static String pageQuery(Integer limit, int most, String before, Pattern cursor, String label) {
+    var query = new StringBuilder();
+    if (limit != null) {
+      if (limit < 1 || limit > most)
+        throw new IllegalArgumentException("limit must be 1 to " + most);
+      query.append("?limit=").append(limit);
+    }
+    if (before != null) {
+      if (!matches(cursor, before)) throw new IllegalArgumentException("Invalid " + label);
+      query.append(query.length() == 0 ? '?' : '&').append("before=").append(before);
+    }
+    return query.toString();
+  }
+
+  private static Map<String, Object> linkBody(String assetId, String name, LinkOptions options) {
+    if (!matches(ASSET_ID, assetId)) throw new IllegalArgumentException("Invalid asset ID");
+    if (name == null || name.isBlank() || name.codePointCount(0, name.length()) > 200)
+      throw new IllegalArgumentException("name must be 1–200 characters");
+    if (options == null) throw new IllegalArgumentException("Give either recipients or allowed domains");
+    boolean recipients = options.recipients() != null && !options.recipients().isEmpty();
+    boolean domains = options.allowedDomains() != null && !options.allowedDomains().isEmpty();
+    if (recipients == domains)
+      throw new IllegalArgumentException("Give either recipients or allowed domains");
+    var audience = recipients ? options.recipients() : options.allowedDomains();
+    for (var value : audience)
+      if (value == null || value.isBlank())
+        throw new IllegalArgumentException("recipients and allowed domains must not be blank");
+    var body = new LinkedHashMap<String, Object>();
+    body.put("asset_id", assetId);
+    body.put("name", name);
+    body.put(recipients ? "recipients" : "allowed_domains", List.copyOf(audience));
+    if (options.expiresAt() != null) body.put("expires_at", options.expiresAt().toString());
+    if (options.prepare() != null) body.put("prepare", options.prepare().value());
+    if (options.downloadLimit() != null) {
+      if (options.downloadLimit() < 1 || options.downloadLimit() > 100)
+        throw new IllegalArgumentException("download limit must be 1 to 100");
+      body.put("download_limit", options.downloadLimit());
+    }
+    if (options.webhookId() != null) {
+      if (!matches(WEBHOOK_ID, options.webhookId()))
+        throw new IllegalArgumentException("Invalid webhook ID");
+      body.put("webhook_id", options.webhookId());
+    }
+    return body;
+  }
+
   // ---------------------------------------------------------------- Internals
 
   private static boolean matches(Pattern pattern, String value) {
@@ -3135,7 +3635,11 @@ public final class EtchvClient implements AutoCloseable {
 
   private <T> T json(String path, String method, Object body, Class<T> type)
       throws InterruptedException {
-    var response = send(path, method, body);
+    return parse(send(path, method, body), type);
+  }
+
+  /** Parses a JSON response body into {@code type}; an empty or invalid body is an error. */
+  private static <T> T parse(HttpResponse<byte[]> response, Class<T> type) {
     try {
       T value = JSON.fromJson(text(response.body()), type);
       if (value == null) throw new JsonParseException("empty");
@@ -3615,7 +4119,9 @@ public final class EtchvClient implements AutoCloseable {
           top.watermarkId(),
           requestId,
           List.copyOf(units),
-          accelerator);
+          accelerator,
+          v.get("copy") instanceof JsonObject copy ? JSON.fromJson(copy, DetectedCopy.class) : null,
+          v.get("asset") instanceof JsonObject asset ? JSON.fromJson(asset, DetectedAsset.class) : null);
     } catch (RuntimeException e) {
       throw new EtchvException(200, "Invalid detection response", requestId, null);
     }

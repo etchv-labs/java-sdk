@@ -7,13 +7,13 @@ Server-side Java client for [Etchv](https://etchv.com): embed and detect invisib
 Maven:
 
 ```xml
-<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.4.0</version></dependency>
+<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.5.0</version></dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("com.etchv:etchv-sdk:1.4.0")
+implementation("com.etchv:etchv-sdk:1.5.0")
 ```
 
 Requires Java 21+. `EtchvClient` is thread-safe; create one and close it on shutdown.
@@ -149,6 +149,28 @@ var result = client.getEmbedResult(requestId); // waits while the job is process
 
 Resending the same request with the same idempotency key returns the existing job without another charge.
 Detection uses `submitDetection`, `getJob(requestId, true)` and `getDetectionResult`.
+
+## Traceable links
+
+Share one file so each recipient downloads their own watermarked copy. Use the source asset of a file you've
+watermarked; send the returned `url()` yourself.
+
+```java
+var link = client.createLink(result.sourceAssetId(), "Board pack, October",
+    EtchvClient.LinkOptions.recipients(List.of("alex@example.com", "sam@example.com")).withDownloadLimit(3));
+System.out.println(link.url());
+```
+
+Use `LinkOptions.allowedDomains(List.of("example.com"))` instead of `recipients` to let anyone at those domains open
+it; `withExpiresAt`, `withPrepare`, `withWebhookId` and `withIdempotencyKey` set the rest. Retries reuse one
+idempotency key, so a retry returns the same link; a workspace without the credits for the copies gets HTTP 402 with
+`code()` `insufficient_credits`. `estimateLink` takes the same arguments and reports the credits the copies would take
+without creating anything. Also `getLink` (each recipient, their opens and their copy), `listLinks`, `listLinkEvents`
+and `revokeLink`.
+
+When a detected file is one of your links' copies, `DetectionResult.copy()` names the link, the recipient and when they
+first opened it (needs `links:read`); `DetectionResult.asset()` names any other watermarked asset of yours (needs
+`assets:read`). Both are null otherwise. See https://etchv.com/docs/api/links.
 
 ## Also included
 
