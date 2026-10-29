@@ -7,13 +7,13 @@ Server-side Java client for [Etchv](https://etchv.com): embed and detect invisib
 Maven:
 
 ```xml
-<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.5.0</version></dependency>
+<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.6.0</version></dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("com.etchv:etchv-sdk:1.5.0")
+implementation("com.etchv:etchv-sdk:1.6.0")
 ```
 
 Requires Java 21+. `EtchvClient` is thread-safe; create one and close it on shutdown.
@@ -167,6 +167,11 @@ idempotency key, so a retry returns the same link; a workspace without the credi
 `code()` `insufficient_credits`. `estimateLink` takes the same arguments and reports the credits the copies would take
 without creating anything. Also `getLink` (each recipient, their opens and their copy), `listLinks`, `listLinkEvents`
 and `revokeLink`.
+
+`deleteLink(id)` deletes a link with every recipient's opens, downloads and copy; `removeLinkRecipient(id, recipientId)`
+does the same for one recipient (their `id()` in `getLink`) and returns the link without them. Neither can be undone,
+and detection no longer names a deleted recipient. Both need an owner or admin and, for an API key, `assets:delete` as
+well as `links:write`.
 
 When a detected file is one of your links' copies, `DetectionResult.copy()` names the link, the recipient and when they
 first opened it (needs `links:read`); `DetectionResult.asset()` names any other watermarked asset of yours (needs

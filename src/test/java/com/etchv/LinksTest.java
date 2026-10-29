@@ -23,6 +23,7 @@ final class LinksTest {
   private static final String LINK = "lnk_" + "a".repeat(32);
   private static final String EVENT = "lev_" + "b".repeat(32);
   private static final String HOOK = "wh_" + "c".repeat(32);
+  private static final String RECIPIENT = "lrc_" + "f".repeat(32);
   private static final String JOB = "req_" + "d".repeat(64);
   private static final String WATERMARK = "ab".repeat(32);
   private static final byte[] PNG = {(byte) 137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3};
@@ -74,8 +75,8 @@ final class LinksTest {
     byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
     e.getResponseHeaders().set("Content-Type", "application/json");
     e.getResponseHeaders().set("X-Request-ID", JOB);
-    e.sendResponseHeaders(status, bytes.length);
-    e.getResponseBody().write(bytes);
+    e.sendResponseHeaders(status, bytes.length == 0 ? -1 : bytes.length);
+    if (bytes.length > 0) e.getResponseBody().write(bytes);
   }
 
   @AfterEach
@@ -99,7 +100,9 @@ final class LinksTest {
         + "\",\"prepare\":\"on_open\",\"allowed_domains\":[],\"expires_at\":\"2026-11-26T14:02:00Z\","
         + "\"download_limit\":3,\"recipient_count\":1,\"credits_per_copy\":2,\"estimated_credits\":2,"
         + "\"batch_id\":null,\"webhook_id\":null,\"created_at\":\"2026-10-28T00:00:00Z\",\"revoked_at\":null,"
-        + "\"recipients\":[{\"email\":\"alex@example.com\",\"status\":\"opened\","
+        + "\"recipients\":[{\"id\":\""
+        + RECIPIENT
+        + "\",\"email\":\"alex@example.com\",\"status\":\"opened\","
         + "\"opened_at\":\"2026-10-28T01:00:00Z\",\"last_opened_at\":\"2026-10-28T02:00:00Z\","
         + "\"open_count\":2,\"download_count\":1,\"copy\":{\"status\":\"ready\",\"asset_id\":\""
         + ASSET
@@ -222,6 +225,10 @@ final class LinksTest {
               () -> client.estimateLink("ast_1", "Board pack", recipients),
               () -> client.getLink("lnk_1"),
               () -> client.revokeLink(null),
+              () -> client.deleteLink("lnk_1"),
+              () -> client.removeLinkRecipient(LINK, "lrc_1"),
+              () -> client.removeLinkRecipient(LINK, LINK),
+              () -> client.removeLinkRecipient("lnk_1", RECIPIENT),
               () -> client.listLinks(0, null),
               () -> client.listLinks(51, null),
               () -> client.listLinks(null, EVENT),
@@ -296,6 +303,7 @@ final class LinksTest {
 
       var read = client.getLink(LINK);
       assertEquals("opened", read.recipients().get(0).status());
+      assertEquals(RECIPIENT, read.recipients().get(0).id());
 
       var events = client.listLinkEvents(LINK, null, EVENT);
       assertNull(events.nextCursor());
@@ -357,6 +365,51 @@ final class LinksTest {
       assertEquals("acme", async.asset().metadata().get("recipient").getAsString());
       assertEquals("2026-10-27T00:00:00Z", async.asset().createdAt());
     }
+  }
+
+  @Test
+  void deleteALinkOrRemoveOneRecipient() throws Exception {
+    serve(
+        route -> {
+          if (route.equals("DELETE /links/" + LINK)) return new Reply(204, "");
+          if (route.equals("DELETE /links/" + LINK + "/recipients/" + RECIPIENT))
+            return new Reply(200, link("active"));
+          if (route.startsWith("DELETE /links/" + LINK + "/recipients/"))
+            return new Reply(404, "{\"detail\":\"Recipient not found\"}");
+          throw new AssertionError("unexpected " + route);
+        });
+    try (var client = client()) {
+      client.deleteLink(LINK);
+      assertEquals(LINK, client.removeLinkRecipient(LINK, RECIPIENT).id());
+      var missing =
+          assertThrows(
+              EtchvClient.EtchvException.class,
+              () -> client.removeLinkRecipient(LINK, "lrc_" + "0".repeat(32)));
+      assertEquals(404, missing.statusCode());
+    }
+    assertEquals(
+        List.of(
+            "DELETE /links/" + LINK,
+            "DELETE /links/" + LINK + "/recipients/" + RECIPIENT,
+            "DELETE /links/" + LINK + "/recipients/lrc_" + "0".repeat(32)),
+        calls);
+  }
+
+  @Test
+  void deletingWithoutAssetsDeleteIsA403() throws Exception {
+    serve(route -> new Reply(403, "{\"detail\":\"needs assets:delete\"}"));
+    try (var client = client()) {
+      var refused = assertThrows(EtchvClient.EtchvException.class, () -> client.deleteLink(LINK));
+      assertEquals(403, refused.statusCode());
+    }
+  }
+
+  @Test
+  void aRecipientKeepsItsEarlierConstructor() {
+    var copy = new EtchvClient.LinkCopy("ready", ASSET, null);
+    var recipient =
+        new EtchvClient.LinkRecipient("alex@example.com", "opened", null, null, 1, 0, copy);
+    assertNull(recipient.id());
   }
 
   @Test

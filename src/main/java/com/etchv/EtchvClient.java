@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.5.0";
+  public static final String VERSION = "1.6.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -827,6 +827,7 @@ public final class EtchvClient implements AutoCloseable {
   private static final Pattern BATCH_ID = Pattern.compile("bat_[a-f0-9]{32}");
   private static final Pattern LINK_ID = Pattern.compile("lnk_[a-f0-9]{32}");
   private static final Pattern LINK_EVENT_ID = Pattern.compile("lev_[a-f0-9]{32}");
+  private static final Pattern LINK_RECIPIENT_ID = Pattern.compile("lrc_[a-f0-9]{32}");
   private static final Pattern IDEMPOTENCY_KEY = Pattern.compile("[A-Za-z0-9_-]{8,128}");
   private static final Set<String> MEDIA = Set.of("images", "documents", "videos");
   private static final Set<String> ASSET_FILTERS =
@@ -3262,6 +3263,7 @@ public final class EtchvClient implements AutoCloseable {
    * @param openCount opens
    * @param downloadCount downloads
    * @param copy the recipient's copy
+   * @param id recipient ID ({@code lrc_…}), which {@link #removeLinkRecipient} takes
    */
   public record LinkRecipient(
       String email,
@@ -3270,7 +3272,30 @@ public final class EtchvClient implements AutoCloseable {
       String lastOpenedAt,
       int openCount,
       int downloadCount,
-      LinkCopy copy) {}
+      LinkCopy copy,
+      String id) {
+    /**
+     * Creates a recipient without an ID.
+     *
+     * @param email recipient's email
+     * @param status {@code not_opened} or {@code opened}
+     * @param openedAt first open (ISO 8601), or null
+     * @param lastOpenedAt latest open (ISO 8601), or null
+     * @param openCount opens
+     * @param downloadCount downloads
+     * @param copy the recipient's copy
+     */
+    public LinkRecipient(
+        String email,
+        String status,
+        String openedAt,
+        String lastOpenedAt,
+        int openCount,
+        int downloadCount,
+        LinkCopy copy) {
+      this(email, status, openedAt, lastOpenedAt, openCount, downloadCount, copy, null);
+    }
+  }
 
   /**
    * A traceable link.
@@ -3496,6 +3521,40 @@ public final class EtchvClient implements AutoCloseable {
    */
   public Link revokeLink(String id) throws InterruptedException {
     return json(linkPath(id) + "/revoke", "POST", null, Link.class);
+  }
+
+  /**
+   * Deletes a link with every recipient's opens, downloads and copy ({@code DELETE /links/{id}},
+   * {@code links:write} and {@code assets:delete}, owner or admin). The link stops at once, as on a
+   * revoke. This can't be undone, and detection no longer names the link's recipients. Deleting
+   * again also succeeds.
+   *
+   * @param id link ID ({@code lnk_…})
+   * @throws EtchvException 403 without an owner or admin, or without {@code assets:delete}
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public void deleteLink(String id) throws InterruptedException {
+    send(linkPath(id), "DELETE", null);
+  }
+
+  /**
+   * Deletes one recipient's opens, downloads and copy, for example when they ask to be erased
+   * ({@code DELETE /links/{id}/recipients/{recipient_id}}, {@code links:write} and {@code
+   * assets:delete}, owner or admin). This can't be undone, and detection no longer names the
+   * recipient.
+   *
+   * @param id link ID ({@code lnk_…})
+   * @param recipientId the recipient's {@link LinkRecipient#id()} ({@code lrc_…})
+   * @return the link without the recipient
+   * @throws EtchvException 404 for an unknown link or recipient; 403 without an owner or admin, or
+   *     without {@code assets:delete}
+   * @throws InterruptedException if the thread is interrupted
+   */
+  public Link removeLinkRecipient(String id, String recipientId) throws InterruptedException {
+    String path = linkPath(id);
+    if (!matches(LINK_RECIPIENT_ID, recipientId))
+      throw new IllegalArgumentException("Invalid recipient ID");
+    return json(path + "/recipients/" + recipientId, "DELETE", null, Link.class);
   }
 
   private static String linkPath(String id) {
