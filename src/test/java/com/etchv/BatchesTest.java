@@ -565,10 +565,13 @@ final class BatchesTest {
           Thread.sleep(1500);
         });
     try (var client = new EtchvClient("test-key", base, Duration.ofMillis(300))) {
+      // A stream that cannot be rewound, so the stall is reported instead of starting again.
       var error =
           assertThrows(
               EtchvClient.EtchvException.class,
-              () -> client.downloadBatchArchive(BATCH, Duration.ofSeconds(5)));
+              () ->
+                  client.downloadBatchArchive(
+                      BATCH, new java.io.ByteArrayOutputStream(), Duration.ofSeconds(5)));
       assertTrue(error.detail().contains("stalled"), error.detail());
       assertTrue(error.getCause() instanceof TimeoutException);
     }

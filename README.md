@@ -7,13 +7,13 @@ Server-side Java client for [Etchv](https://etchv.com): embed and detect invisib
 Maven:
 
 ```xml
-<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.6.0</version></dependency>
+<dependency><groupId>com.etchv</groupId><artifactId>etchv-sdk</artifactId><version>1.7.0</version></dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("com.etchv:etchv-sdk:1.6.0")
+implementation("com.etchv:etchv-sdk:1.7.0")
 ```
 
 Requires Java 21+. `EtchvClient` is thread-safe; create one and close it on shutdown.
@@ -93,8 +93,10 @@ stay available for 24 hours. `waitForBatch(id, timeout)` and `batchResults(id, t
 `Retry-After` between polls, at least 1 s apart (the wait is one hour when the timeout is null).
 
 `downloadBatchArchive` waits while the zip is assembled, then writes it to a `Path` or an `OutputStream` (or returns
-the bytes); it fails only if no bytes arrive for the client timeout. A 409 carries `code()` `batch_not_started`,
-`archive_not_requested`, `archive_too_large` or `archive_unavailable`.
+the bytes); it fails only if no bytes arrive for the client timeout. If the connection drops or stalls mid-download,
+the download starts again from the beginning until the timeout: a `Path`, the returned bytes and a `FileOutputStream`
+are truncated first, while any other `OutputStream` has already passed the bytes on, so the failure is thrown instead.
+A 409 carries `code()` `batch_not_started`, `archive_not_requested`, `archive_too_large` or `archive_unavailable`.
 
 Files that are already together in one zip (up to 55 MB) can go in a single request with `submitBatchZip`, naming
 every member in its manifest:
@@ -197,6 +199,20 @@ Durable operations (embedding, video detection, async submissions and job result
 504 with the same idempotency key until the client deadline; rate-limited responses wait for `Retry-After` (up to
 5 s per wait). Structured errors include the API's message in `getMessage()` and expose `code()` (for example
 `rate_limited` or `concurrency_limited`), `detailMessage()` and `limit()`; a 429 also carries `retryAfter()`.
+
+These calls also retry a dropped connection within the client deadline: embedding, `detectVideo`, `submitEmbed`,
+`submitDetection`, `getEmbedResult`, `getDetectionResult`, `submitBatch`, `submitBatchZip`, `getBatch`,
+`waitForBatch`, `cancelBatch`, `listBatches`, `createLink`, `detectImage`, `detectDocument`, `downloadAsset`,
+`downloadStorageDelivery` and `downloadBatchArchive`. Other calls throw status 0.
+
+`detectImage` and `detectDocument` resend with the same idempotency key (generated when null), and the API returns
+the first result without charging again. A retry the API reports as still running (409 `request_in_progress`, or
+`upload_in_use` for a file sent through an upload) waits and is sent again; 409 `replay_expired` or `request_failed`
+throw with that `code()`. The API keeps the result 24 hours for this; pass `options.withKeepResult(false)` to keep
+nothing, and a retry then runs detection again at no charge, after the SDK uploads the file again if it went through
+an upload. The detection requests, resends included, stay within one client timeout counted from the first send;
+uploading the file again is bounded like any upload. Exceptions from a keyed call carry its
+`idempotencyKey()`, so you can resend it yourself. A batch archive starts again from the beginning.
 
 ```java
 } catch (EtchvClient.EtchvException e) {

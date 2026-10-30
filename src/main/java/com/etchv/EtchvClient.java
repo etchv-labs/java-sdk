@@ -40,7 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public final class EtchvClient implements AutoCloseable {
   /** SDK version, also sent in the {@code User-Agent} header. */
-  public static final String VERSION = "1.6.0";
+  public static final String VERSION = "1.7.0";
 
   /** {@code User-Agent} header value sent with every request. */
   public static final String USER_AGENT = "etchv-java/" + VERSION;
@@ -422,7 +422,7 @@ public final class EtchvClient implements AutoCloseable {
    *
    * @param filename original filename sent with the upload; a media default is used when null
    * @param idempotencyKey key for safe retries (8–128 letters, digits, hyphens or underscores);
-   *     generated when null for durable operations
+   *     generated when null for durable operations and image and document detection
    * @param storageDestinationId verified customer storage destination ({@code dst_…}) for
    *     embedding results; null uses Etchv storage
    * @param storageKey optional relative object key beneath the destination prefix; requires a
@@ -430,6 +430,9 @@ public final class EtchvClient implements AutoCloseable {
    * @param accelerator requested processing hardware; null omits the parameter (CPU)
    * @param activeContent what a watermarked PDF keeps of its scripts and actions; null omits the
    *     parameter ({@link ActiveContent#KEEP}). Embedding documents only
+   * @param keepResult whether the API keeps an image or document detection result for 24 hours so
+   *     a retry gets it back; null omits the parameter (the API keeps it). With {@code false} a
+   *     retry runs detection again at no charge. Image and document detection only
    */
   public record Options(
       String filename,
@@ -437,7 +440,28 @@ public final class EtchvClient implements AutoCloseable {
       String storageDestinationId,
       String storageKey,
       Accelerator accelerator,
-      ActiveContent activeContent) {
+      ActiveContent activeContent,
+      Boolean keepResult) {
+    /**
+     * Options without a keep-result choice.
+     *
+     * @param filename original filename, or null
+     * @param idempotencyKey idempotency key, or null
+     * @param storageDestinationId storage destination ID, or null
+     * @param storageKey storage object key, or null
+     * @param accelerator requested processing hardware, or null
+     * @param activeContent active-content choice, or null
+     */
+    public Options(
+        String filename,
+        String idempotencyKey,
+        String storageDestinationId,
+        String storageKey,
+        Accelerator accelerator,
+        ActiveContent activeContent) {
+      this(filename, idempotencyKey, storageDestinationId, storageKey, accelerator, activeContent, null);
+    }
+
     /**
      * Options without an active-content choice.
      *
@@ -477,7 +501,13 @@ public final class EtchvClient implements AutoCloseable {
      */
     public Options withAccelerator(Accelerator accelerator) {
       return new Options(
-          filename, idempotencyKey, storageDestinationId, storageKey, accelerator, activeContent);
+          filename,
+          idempotencyKey,
+          storageDestinationId,
+          storageKey,
+          accelerator,
+          activeContent,
+          keepResult);
     }
 
     /**
@@ -489,7 +519,32 @@ public final class EtchvClient implements AutoCloseable {
      */
     public Options withActiveContent(ActiveContent activeContent) {
       return new Options(
-          filename, idempotencyKey, storageDestinationId, storageKey, accelerator, activeContent);
+          filename,
+          idempotencyKey,
+          storageDestinationId,
+          storageKey,
+          accelerator,
+          activeContent,
+          keepResult);
+    }
+
+    /**
+     * Returns a copy of these options with the given keep-result choice (image and document
+     * detection only).
+     *
+     * @param keepResult {@code false} to have the API keep no copy of the result, or null for the
+     *     default (kept 24 hours for retries)
+     * @return new options
+     */
+    public Options withKeepResult(Boolean keepResult) {
+      return new Options(
+          filename,
+          idempotencyKey,
+          storageDestinationId,
+          storageKey,
+          accelerator,
+          activeContent,
+          keepResult);
     }
 
     /**
@@ -1195,12 +1250,24 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Detects a watermark in an image. Synchronous image detection is not retried automatically.
+   * Detects a watermark in an image.
+   *
+   * <p>A dropped connection is retried with the same idempotency key (generated when null) until
+   * the client deadline, and so is a retry the API reports as still running (HTTP 409 {@code
+   * request_in_progress}, or {@code upload_in_use} while the first copy holds the file's upload;
+   * after {@code Retry-After}, at most 5 s per wait). The API returns the first result without
+   * charging again. Other errors are not retried: HTTP 409 {@code replay_expired} or {@code
+   * request_failed} throw with that {@link EtchvException#code()}. Every exception carries the key
+   * as {@link EtchvException#idempotencyKey()}. The API keeps the result 24 hours for those retries
+   * unless {@link Options#keepResult()} is {@code false}; a retry then runs detection again on the
+   * resent file at no charge (a file that went through an upload is uploaded again, bounded like
+   * any upload; the resend after it stays within the client timeout counted from the first send).
    *
    * @param file delivered image bytes (1 byte to 192 MB; above 95 MB as a job)
    * @param options request options (storage options are not allowed), or null
    * @return detection result
-   * @throws EtchvException on API or transport failure
+   * @throws EtchvException on API or transport failure; status 0 with the idempotency key at the
+   *     client deadline
    * @throws InterruptedException if the thread is interrupted
    */
   public DetectionResult detectImage(byte[] file, Options options) throws InterruptedException {
@@ -1208,12 +1275,15 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Detects watermarks in a PDF (page by page), DOCX or PPTX. Not retried automatically.
+   * Detects watermarks in a PDF (page by page), DOCX or PPTX. Retried like {@link #detectImage}.
+   * {@link Options#keepResult()} applies to detection answered in the request; a long PDF runs as a
+   * job, which keeps its result like any job.
    *
    * @param file delivered PDF (up to 95 MB), DOCX or PPTX (up to 100 MB) bytes
    * @param options request options (storage options are not allowed), or null
    * @return detection result
-   * @throws EtchvException on API or transport failure
+   * @throws EtchvException on API or transport failure; status 0 with the idempotency key at the
+   *     client deadline
    * @throws InterruptedException if the thread is interrupted
    */
   public DetectionResult detectDocument(byte[] file, Options options) throws InterruptedException {
@@ -1433,7 +1503,8 @@ public final class EtchvClient implements AutoCloseable {
   }
 
   /**
-   * Downloads an asset file ({@code GET /assets/{id}/content}).
+   * Downloads an asset file ({@code GET /assets/{id}/content}). A dropped connection is retried
+   * within the client deadline.
    *
    * @param id asset ID ({@code ast_…})
    * @return file bytes in the original format
@@ -1441,7 +1512,7 @@ public final class EtchvClient implements AutoCloseable {
    * @throws InterruptedException if the thread is interrupted
    */
   public byte[] downloadAsset(String id) throws InterruptedException {
-    return send(assetPath(id) + "/content", "GET", null).body();
+    return download(assetPath(id) + "/content");
   }
 
   // ---------------------------------------------------------------- Webhooks
@@ -1736,7 +1807,7 @@ public final class EtchvClient implements AutoCloseable {
 
   /**
    * Downloads a stored delivery from the customer bucket ({@code GET
-   * /storage/deliveries/{id}/content}).
+   * /storage/deliveries/{id}/content}). A dropped connection is retried within the client deadline.
    *
    * @param id delivery ID ({@code std_…})
    * @return file bytes
@@ -1744,7 +1815,7 @@ public final class EtchvClient implements AutoCloseable {
    * @throws InterruptedException if the thread is interrupted
    */
   public byte[] downloadStorageDelivery(String id) throws InterruptedException {
-    return send(deliveryPath(id) + "/content", "GET", null).body();
+    return download(deliveryPath(id) + "/content");
   }
 
   // ---------------------------------------------------------------- Batches
@@ -2566,7 +2637,7 @@ public final class EtchvClient implements AutoCloseable {
   public byte[] downloadBatchArchive(String batchId, Duration timeout)
       throws InterruptedException {
     var buffer = new ByteArrayOutputStream();
-    downloadBatchArchive(batchId, buffer, timeout);
+    archive(batchId, buffer, timeout, buffer::reset);
     return buffer.toByteArray();
   }
 
@@ -2598,7 +2669,8 @@ public final class EtchvClient implements AutoCloseable {
     boolean moved = false;
     try {
       long written;
-      try (var out = java.nio.file.Files.newOutputStream(temporary)) {
+      // A file stream can be truncated, so a dropped download starts again in the same file.
+      try (var out = new FileOutputStream(temporary.toFile())) {
         written = downloadBatchArchive(batchId, out, timeout);
       } catch (IOException e) {
         throw new UncheckedIOException("Cannot write " + destination, e);
@@ -2640,6 +2712,12 @@ public final class EtchvClient implements AutoCloseable {
    * same wait. Each request must answer within the client timeout, and the download fails if no
    * bytes arrive for the client timeout, however long the whole download takes.
    *
+   * <p>The archive route does not resume a download, so a connection that drops (or stalls)
+   * mid-download starts it again from the beginning until {@code timeout} passes. That needs the
+   * written bytes taken back: a {@link FileOutputStream} is truncated to where the download began,
+   * and the {@code Path} and in-memory overloads do the same. Any other stream has already passed
+   * the bytes on, so the failure is thrown instead.
+   *
    * @param batchId batch ID ({@code bat_…})
    * @param destination stream that receives the zip; not closed
    * @param timeout how long to wait while the archive is assembled; null or zero for {@link
@@ -2654,6 +2732,36 @@ public final class EtchvClient implements AutoCloseable {
    * @throws InterruptedException if the thread is interrupted
    */
   public long downloadBatchArchive(String batchId, OutputStream destination, Duration timeout)
+      throws InterruptedException {
+    return archive(
+        batchId, Objects.requireNonNull(destination, "destination"), timeout, rewinder(destination));
+  }
+
+  /**
+   * Truncates a file stream back to where the archive began, or null for a stream that cannot
+   * seek, such as a pipe or socket.
+   */
+  private static Runnable rewinder(OutputStream destination) {
+    if (!(destination instanceof FileOutputStream file)) return null;
+    var channel = file.getChannel();
+    long start;
+    try {
+      start = channel.position();
+    } catch (IOException e) {
+      return null;
+    }
+    return () -> {
+      try {
+        channel.truncate(start);
+        channel.position(start);
+      } catch (IOException e) {
+        throw new UncheckedIOException("Cannot write the archive", e);
+      }
+    };
+  }
+
+  /** The archive download; {@code rewind} takes back what was written, or is null when it can't. */
+  private long archive(String batchId, OutputStream destination, Duration timeout, Runnable rewind)
       throws InterruptedException {
     String path = batchPath(batchId) + "/archive";
     Objects.requireNonNull(destination, "destination");
@@ -2690,9 +2798,18 @@ public final class EtchvClient implements AutoCloseable {
         requestId = response.headers().firstValue("X-Request-ID").orElse(requestId);
         int status = response.statusCode();
         try (var body = new IdleStream(response.body(), this.timeout)) {
-          if (status == 200) return copyArchive(body, destination, response, requestId);
-          byte[] detail = readDetail(body);
-          if (status == 202) {
+          byte[] detail = status == 200 ? null : readDetail(body);
+          if (status == 200) {
+            try {
+              return copyArchive(body, destination, response, requestId);
+            } catch (EtchvException e) {
+              // Status 0 is a dropped or stalled download; others (too large, not a zip) are final.
+              if (e.statusCode != 0 || rewind == null || System.nanoTime() >= deadline) throw e;
+              // The archive route does not serve Range requests: drop what was written, start over.
+              rewind.run();
+              lastFailure = e;
+            }
+          } else if (status == 202) {
             lastFailure = null;
             delay = pollDelayNanos(response);
           } else if (Set.of(429, 502, 503, 504).contains(status)) {
@@ -3724,6 +3841,8 @@ public final class EtchvClient implements AutoCloseable {
       throw new IllegalArgumentException("Invalid webhook ID");
     if (options == null) options = new Options();
     checkActiveContent(media, data, options);
+    if (options.keepResult() != null)
+      throw new IllegalArgumentException("keepResult applies to image and document detection only");
     String idempotency = options.idempotencyKey();
     if (idempotency == null || idempotency.isEmpty()) idempotency = UUID.randomUUID().toString();
     String filename = options.filename() == null ? defaultFilename(media) : options.filename();
@@ -3745,7 +3864,9 @@ public final class EtchvClient implements AutoCloseable {
                 options.accelerator(),
                 options.activeContent()),
             true,
-            data == null);
+            data == null,
+            false,
+            System.nanoTime());
     return parseObject(r.body());
   }
 
@@ -3770,8 +3891,10 @@ public final class EtchvClient implements AutoCloseable {
       throw new IllegalArgumentException(
           "file must contain 1 byte to " + MAX_DETECTION_FILE_SIZE / (1024 * 1024) + " MB");
     if (!media.equals("videos") && file != null && file.length > SYNC_DETECTION_MAX_SIZE) {
-      // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
-      var receipt = submitDetection(media, file, options, null);
+      // Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job,
+      // which keeps its result like any job.
+      var receipt =
+          submitDetection(media, file, options == null ? null : options.withKeepResult(null), null);
       return getDetectionResult(receipt.get("request_id").getAsString());
     }
     return detection(post(media, file, null, options));
@@ -3810,24 +3933,48 @@ public final class EtchvClient implements AutoCloseable {
     if (options == null) options = new Options();
     checkActiveContent(media, data, options);
     boolean durable = data != null || media.equals("videos");
+    // Image and document detection answer in the request; the API replays them for the same key.
+    boolean resend = !durable;
+    if (options.keepResult() != null && !resend)
+      throw new IllegalArgumentException("keepResult applies to image and document detection only");
     String filename = options.filename() != null ? options.filename() : defaultFilename(media);
     String idempotency = options.idempotencyKey();
-    if (durable && (idempotency == null || idempotency.isEmpty()))
-      idempotency = UUID.randomUUID().toString();
-    return request(
-        "watermarks/" + media + (data == null ? "/detect" : ""),
-        file,
-        uploadIdFor(media, file, data == null, filename),
-        data,
+    if (idempotency == null || idempotency.isEmpty()) idempotency = UUID.randomUUID().toString();
+    String path = "watermarks/" + media + (data == null ? "/detect" : "");
+    var sent =
         new Options(
             filename,
             idempotency,
             options.storageDestinationId(),
             options.storageKey(),
             options.accelerator(),
-            options.activeContent()),
-        durable,
-        data == null && media.equals("videos"));
+            options.activeContent(),
+            options.keepResult());
+    boolean detectionJob = data == null && media.equals("videos");
+    String uploadId = keyedUpload(media, file, data == null, filename, idempotency);
+    // The client deadline starts with the first request, after the first upload; a resend after a
+    // new upload stays within it.
+    long started = System.nanoTime();
+    try {
+      return request(path, file, uploadId, data, sent, durable, detectionJob, resend, started);
+    } catch (EtchvException e) {
+      if (!resend || uploadId == null || !"upload_consumed".equals(e.code)) throw e;
+    }
+    // A dropped detection consumed the upload and kept no result (keepResult false): the API
+    // re-runs it on the same bytes, so upload them again and resend with the same key.
+    uploadId = keyedUpload(media, file, true, filename, idempotency);
+    return request(path, file, uploadId, data, sent, durable, detectionJob, resend, started);
+  }
+
+  /** {@link #uploadIdFor}, with the request's key on a failure so the caller can resend with it. */
+  private String keyedUpload(
+      String media, byte[] file, boolean detect, String filename, String idempotency)
+      throws InterruptedException {
+    try {
+      return uploadIdFor(media, file, detect, filename);
+    } catch (EtchvException e) {
+      throw new EtchvException(e.statusCode, e.detail, e.requestId, idempotency, e, e.retryAfter);
+    }
   }
 
   private static byte[] multipart(
@@ -3933,10 +4080,24 @@ public final class EtchvClient implements AutoCloseable {
   private HttpResponse<byte[]> request(
       String path, byte[] file, String data, Options options, boolean durable, boolean detectionJob)
       throws InterruptedException {
-    return request(path, file, null, data, options, durable, detectionJob);
+    return request(
+        path, file, null, data, options, durable, detectionJob, false, System.nanoTime());
   }
 
-  /** As above; with {@code uploadId}, the form names that upload session instead of the file. */
+  /** A GET download, which is safe to send again after a dropped connection. */
+  private byte[] download(String path) throws InterruptedException {
+    return request(path, null, null, null, new Options(), false, false, true, System.nanoTime())
+        .body();
+  }
+
+  /**
+   * As above; with {@code uploadId}, the form names that upload session instead of the file.
+   * {@code resend} is for a request the API answers the same way twice (a GET download, or an
+   * instant detection with its Idempotency-Key): it is sent again after a dropped connection and
+   * while the API reports the first copy still running (HTTP 409 {@code request_in_progress}, or
+   * {@code upload_in_use} while it holds the upload this call created), but no error status is
+   * retried. The client timeout counts from {@code started} ({@link System#nanoTime()}).
+   */
   private HttpResponse<byte[]> request(
       String path,
       byte[] file,
@@ -3944,7 +4105,9 @@ public final class EtchvClient implements AutoCloseable {
       String data,
       Options options,
       boolean durable,
-      boolean detectionJob)
+      boolean detectionJob,
+      boolean resend,
+      long started)
       throws InterruptedException {
     if (options.storageKey() != null && options.storageDestinationId() == null)
       throw new IllegalArgumentException("Storage key requires destination");
@@ -3961,12 +4124,13 @@ public final class EtchvClient implements AutoCloseable {
       path += (path.contains("?") ? "&" : "?") + "accelerator=" + options.accelerator().value();
     if (options.activeContent() != null)
       path += (path.contains("?") ? "&" : "?") + "active_content=" + options.activeContent().value();
-    long started = System.nanoTime();
+    if (options.keepResult() != null)
+      path += (path.contains("?") ? "&" : "?") + "keep_result=" + options.keepResult();
     String requestId = null;
     String boundary = "etchv-" + UUID.randomUUID();
     byte[] body =
         file == null ? null : multipart(file, uploadId, data, options.filename(), boundary);
-    IOException lastFailure = null;
+    IOException lastFailure = null, dropped = null;
     while (System.nanoTime() - started < timeout.toNanos()) {
       if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
       var builder =
@@ -3984,12 +4148,19 @@ public final class EtchvClient implements AutoCloseable {
       try {
         response = http.send(builder.build(), ignored -> new LimitedBody());
       } catch (IOException e) {
-        if (!durable || tooLarge(e))
+        // A download out of time throws the dropped connection; a keyed request ends with the
+        // deadline error and its key.
+        boolean outOfTime =
+            !durable
+                && options.idempotencyKey() == null
+                && timeout.toNanos() - (System.nanoTime() - started) <= 1_000_000_000L;
+        if (!(durable || resend) || tooLarge(e) || outOfTime)
           throw new EtchvException(0, e.getMessage(), requestId, options.idempotencyKey(), e);
-        lastFailure = e;
+        lastFailure = dropped = e;
         pause(started, 1);
         continue;
       }
+      dropped = null;
       requestId = response.headers().firstValue("X-Request-ID").orElse(requestId);
       int status = response.statusCode();
       if (status == 200 || (status == 202 && path.split("\\?", 2)[0].endsWith("/async")))
@@ -4032,14 +4203,27 @@ public final class EtchvClient implements AutoCloseable {
                 : 1);
         continue;
       }
-      throw new EtchvException(
-          status,
-          bounded(response.body()),
-          requestId,
-          options.idempotencyKey(),
-          null,
-          rateLimitDelay(response));
+      var error =
+          new EtchvException(
+              status,
+              bounded(response.body()),
+              requestId,
+              options.idempotencyKey(),
+              null,
+              rateLimitDelay(response));
+      if (resend
+          && status == 409
+          && ("request_in_progress".equals(error.code)
+              || (uploadId != null && "upload_in_use".equals(error.code)))) {
+        pause(
+            started, retryDelaySeconds(response.headers().firstValue("Retry-After").orElse(null)));
+        continue;
+      }
+      throw error;
     }
+    // A download out of time throws its dropped connection, not a job deadline.
+    if (dropped != null && !durable && options.idempotencyKey() == null)
+      throw new EtchvException(0, dropped.getMessage(), requestId, null, dropped);
     throw new EtchvException(
         0,
         "Client deadline exceeded; job may still complete",
